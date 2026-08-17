@@ -14,9 +14,16 @@ interface CodeReviewSession {
   responseBytes: number;
 }
 
+interface PendingCodeReviewRequest {
+  owner: string;
+  repo: string;
+  durationMinutes: DurationMinutes;
+}
+
 interface ControlResponse {
   success: boolean;
   session?: CodeReviewSession | null;
+  pendingRequest?: PendingCodeReviewRequest | null;
   error?: string;
 }
 
@@ -53,7 +60,20 @@ export function CodeReviewAccessFa() {
       if (!response.success) {
         throw new Error(response.error || 'دریافت وضعیت دسترسی ناموفق بود.');
       }
-      setSession(response.session || null);
+
+      const activeSession = response.session || null;
+      const pendingRequest = response.pendingRequest || null;
+
+      setSession(activeSession);
+
+      if (activeSession) {
+        setConfirming(false);
+      } else if (pendingRequest) {
+        setOwner(pendingRequest.owner);
+        setRepo(pendingRequest.repo);
+        setDuration(pendingRequest.durationMinutes);
+        setConfirming(true);
+      }
     } catch (statusError) {
       setError(statusError instanceof Error ? statusError.message : 'دریافت وضعیت دسترسی ناموفق بود.');
     }
@@ -62,10 +82,14 @@ export function CodeReviewAccessFa() {
   useEffect(() => {
     void loadStatus();
 
+    const handlePendingUpdate = () => void loadStatus();
+    window.addEventListener('code-review:pending-updated', handlePendingUpdate);
+
     const clock = window.setInterval(() => setNow(Date.now()), 1000);
     const statusPoll = window.setInterval(() => void loadStatus(), 5000);
 
     return () => {
+      window.removeEventListener('code-review:pending-updated', handlePendingUpdate);
       window.clearInterval(clock);
       window.clearInterval(statusPoll);
     };
