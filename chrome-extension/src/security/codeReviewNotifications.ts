@@ -37,6 +37,17 @@ async function createSecurityNotification(title: string, message: string): Promi
   }
 }
 
+export async function notifyCodeReviewAccessRequested(
+  owner: string,
+  repo: string,
+  durationMinutes: number,
+): Promise<void> {
+  await createSecurityNotification(
+    'درخواست دسترسی Code Review',
+    `درخواست دسترسی فقط‌خواندنی به ${owner}/${repo} برای ${durationMinutes} دقیقه ثبت شد. برای فعال‌سازی، تأیید نهایی لازم است.`,
+  );
+}
+
 export async function notifyCodeReviewStarted(owner: string, repo: string, durationMinutes: number): Promise<void> {
   await createSecurityNotification(
     'دسترسی Code Review فعال شد',
