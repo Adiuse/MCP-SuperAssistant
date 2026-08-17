@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react';
 import { CodeReviewAccessFa } from '../CodeReviewAccessFa';
 import { SecurityCenterFa } from '../SecurityCenterFa';
+import { HeadlessInstructionSync } from './Instructions/HeadlessInstructionSync';
 
 interface SidebarProps {
   initialPreferences?: unknown;
@@ -39,6 +40,8 @@ const Sidebar: React.FC<SidebarProps> = () => {
     <aside
       dir="rtl"
       className="pointer-events-auto fixed right-0 top-0 z-[2147483646] flex h-screen w-[380px] flex-col border-l border-slate-200 bg-slate-50 text-right shadow-2xl dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100">
+      <HeadlessInstructionSync />
+
       <header className="flex flex-shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 py-3 dark:border-slate-700 dark:bg-slate-900">
         <div>
           <h1 className="text-base font-bold text-slate-900 dark:text-slate-100">مرکز امنیت بررسی کد</h1>
