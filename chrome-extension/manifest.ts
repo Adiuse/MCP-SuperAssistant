@@ -16,6 +16,8 @@ const manifest = {
   host_permissions: [
     '*://*.github.com/*',
     '*://*.copilot.github.com/*',
+    'http://localhost/*',
+    'http://127.0.0.1/*',
   ],
   permissions: ['storage', 'clipboardWrite', 'notifications', 'alarms'],
   background: {
