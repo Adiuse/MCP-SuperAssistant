@@ -6,12 +6,21 @@ const EXPIRY_ALARM_NAME = 'mcp-code-review-expiry';
 const EXPIRY_NOTICE_KEY = 'mcpCodeReviewExpiryNotice';
 const DENIED_NOTIFICATION_COOLDOWN_MS = 10_000;
 
-interface ExpiryNotice {
+export interface ExpiryNotice {
   sessionId: string;
   owner: string;
   repo: string;
   expiresAt: number;
 }
+
+export interface CodeReviewNotificationEvent {
+  kind: 'session_expired';
+  sessionId: string;
+  owner: string;
+  repo: string;
+}
+
+type NotificationSentHandler = (event: CodeReviewNotificationEvent) => void | Promise<void>;
 
 let registered = false;
 let lastDeniedNotificationAt = 0;
@@ -21,8 +30,8 @@ function canNotify(): boolean {
   return typeof chrome !== 'undefined' && Boolean(chrome.notifications?.create);
 }
 
-async function createSecurityNotification(title: string, message: string): Promise<void> {
-  if (!canNotify()) return;
+async function createSecurityNotification(title: string, message: string): Promise<boolean> {
+  if (!canNotify()) return false;
 
   try {
     await chrome.notifications.create({
@@ -32,8 +41,10 @@ async function createSecurityNotification(title: string, message: string): Promi
       message,
       priority: 2,
     });
+    return true;
   } catch (error) {
     logger.warn('[CodeReviewNotifications] Failed to create notification:', error);
+    return false;
   }
 }
 
@@ -41,38 +52,42 @@ export async function notifyCodeReviewAccessRequested(
   owner: string,
   repo: string,
   durationMinutes: number,
-): Promise<void> {
-  await createSecurityNotification(
+): Promise<boolean> {
+  return await createSecurityNotification(
     'درخواست دسترسی Code Review',
     `درخواست دسترسی فقط‌خواندنی به ${owner}/${repo} برای ${durationMinutes} دقیقه ثبت شد. برای فعال‌سازی، تأیید نهایی لازم است.`,
   );
 }
 
-export async function notifyCodeReviewStarted(owner: string, repo: string, durationMinutes: number): Promise<void> {
-  await createSecurityNotification(
+export async function notifyCodeReviewStarted(
+  owner: string,
+  repo: string,
+  durationMinutes: number,
+): Promise<boolean> {
+  return await createSecurityNotification(
     'دسترسی Code Review فعال شد',
     `${owner}/${repo} برای ${durationMinutes} دقیقه، فقط خواندنی فعال شد.`,
   );
 }
 
-export async function notifyCodeReviewRevoked(owner?: string, repo?: string): Promise<void> {
+export async function notifyCodeReviewRevoked(owner?: string, repo?: string): Promise<boolean> {
   const target = owner && repo ? ` برای ${owner}/${repo}` : '';
-  await createSecurityNotification('دسترسی Code Review لغو شد', `دسترسی موقت${target} فوراً غیرفعال شد.`);
+  return await createSecurityNotification('دسترسی Code Review لغو شد', `دسترسی موقت${target} فوراً غیرفعال شد.`);
 }
 
-export async function notifyCodeReviewDenied(toolName: string, reason: string): Promise<void> {
+export async function notifyCodeReviewDenied(toolName: string, reason: string): Promise<boolean> {
   const now = Date.now();
   const fingerprint = `${toolName}:${reason}`;
 
   if (fingerprint === lastDeniedFingerprint && now - lastDeniedNotificationAt < DENIED_NOTIFICATION_COOLDOWN_MS) {
-    return;
+    return false;
   }
 
   lastDeniedFingerprint = fingerprint;
   lastDeniedNotificationAt = now;
 
   const shortReason = reason.length > 180 ? `${reason.slice(0, 177)}...` : reason;
-  await createSecurityNotification(
+  return await createSecurityNotification(
     'درخواست Code Review مسدود شد',
     `${toolName}: ${shortReason}`,
   );
@@ -103,7 +118,7 @@ export async function clearCodeReviewExpiryNotification(): Promise<void> {
   }
 }
 
-export function registerCodeReviewNotificationListeners(): void {
+export function registerCodeReviewNotificationListeners(onSent?: NotificationSentHandler): void {
   if (registered || typeof chrome === 'undefined' || !chrome.alarms?.onAlarm) return;
   registered = true;
 
@@ -118,10 +133,19 @@ export function registerCodeReviewNotificationListeners(): void {
 
         if (!notice) return;
 
-        await createSecurityNotification(
+        const sent = await createSecurityNotification(
           'دسترسی Code Review منقضی شد',
           `دسترسی ${notice.owner}/${notice.repo} پایان یافت. برای بررسی جدید دوباره تأیید کنید.`,
         );
+
+        if (sent && onSent) {
+          await onSent({
+            kind: 'session_expired',
+            sessionId: notice.sessionId,
+            owner: notice.owner,
+            repo: notice.repo,
+          });
+        }
       } catch (error) {
         logger.warn('[CodeReviewNotifications] Expiry alarm handling failed:', error);
       }
