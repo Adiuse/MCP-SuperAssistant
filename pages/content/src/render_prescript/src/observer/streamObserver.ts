@@ -300,7 +300,7 @@ const processChunkImmediate = (
   }
 
   // Use immediate scheduling with appropriate delay for chunk type
-  const timer = setTimeout(() => {
+  const timer = window.setTimeout(() => {
     if (!completedStreams.has(blockId) && !resyncingBlocks.has(blockId)) {
       const targetQueue = window._updateQueue || updateQueue;
       targetQueue.set(blockId, target);
@@ -420,7 +420,7 @@ const scheduleOptimizedRender = (blockId: string, target: HTMLElement): void => 
   }
 
   // Schedule new render with debouncing
-  const timer = setTimeout(() => {
+  const timer = window.setTimeout(() => {
     renderingDebouncer.delete(blockId);
 
     // Only render if not completed or resyncing

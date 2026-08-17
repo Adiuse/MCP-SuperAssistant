@@ -894,7 +894,7 @@ export function startThemeMonitoring(): void {
 
   const checkThemeChange = () => {
     clearTimeout(debounceTimeout);
-    debounceTimeout = setTimeout(() => {
+    debounceTimeout = window.setTimeout(() => {
       const newThemeState = getCurrentThemeState();
 
       // Check if theme has actually changed
