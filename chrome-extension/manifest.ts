@@ -14,6 +14,8 @@ const manifest = {
   version: packageJson.version,
   description: 'MCP SuperAssistant',
   host_permissions: [
+    '*://*.chat.openai.com/*',
+    '*://*.chatgpt.com/*',
     '*://*.github.com/*',
     '*://*.copilot.github.com/*',
     'http://localhost/*',
@@ -29,6 +31,24 @@ const manifest = {
     34: 'icon-34.png',
     16: 'icon-16.png',
   },
+  content_scripts: [
+    {
+      matches: ['*://*.chat.openai.com/*', '*://*.chatgpt.com/*'],
+      js: ['content/index.iife.js'],
+      run_at: 'document_idle',
+    },
+    {
+      matches: ['*://*.github.com/*', '*://*.copilot.github.com/*'],
+      js: ['content/index.iife.js'],
+      run_at: 'document_idle',
+    },
+  ],
+  web_accessible_resources: [
+    {
+      resources: ['*.js', '*.css', 'content/*.css', '*.svg', 'icon-128.png', 'icon-34.png', 'icon-16.png'],
+      matches: ['*://*/*'],
+    },
+  ],
 } satisfies chrome.runtime.ManifestV3;
 
 export default manifest;
