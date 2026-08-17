@@ -60,10 +60,10 @@ export function CodeReviewAccessFa() {
   };
 
   useEffect(() => {
-    loadStatus();
+    void loadStatus();
 
     const clock = window.setInterval(() => setNow(Date.now()), 1000);
-    const statusPoll = window.setInterval(() => loadStatus(), 5000);
+    const statusPoll = window.setInterval(() => void loadStatus(), 5000);
 
     return () => {
       window.clearInterval(clock);
@@ -114,9 +114,30 @@ export function CodeReviewAccessFa() {
     return true;
   };
 
-  const requestConfirmation = () => {
-    if (validateRepository()) {
+  const requestConfirmation = async () => {
+    if (!validateRepository()) return;
+
+    setLoading(true);
+    setError('');
+    try {
+      const response = await sendControlMessage<ControlResponse>({
+        type: 'code-review:request',
+        payload: {
+          owner: owner.trim(),
+          repo: repo.trim(),
+          durationMinutes: duration,
+        },
+      });
+
+      if (!response.success) {
+        throw new Error(response.error || 'ثبت درخواست دسترسی ناموفق بود.');
+      }
+
       setConfirming(true);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'ثبت درخواست دسترسی ناموفق بود.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -215,7 +236,7 @@ export function CodeReviewAccessFa() {
           <button
             type="button"
             disabled={loading}
-            onClick={revoke}
+            onClick={() => void revoke()}
             className="w-full rounded-lg border border-red-300 px-4 py-2 text-sm font-semibold text-red-700 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950">
             {loading ? 'در حال لغو...' : 'لغو فوری دسترسی'}
           </button>
@@ -224,7 +245,7 @@ export function CodeReviewAccessFa() {
         <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/40">
           <div className="font-bold text-amber-900 dark:text-amber-200">تأیید نهایی دسترسی</div>
           <p className="mt-2 text-sm text-amber-900/80 dark:text-amber-200/80">
-            لطفاً قبل از فعال‌سازی، مشخصات زیر را بررسی کنید. بعد از پایان زمان، دسترسی خودکار منقضی می‌شود و تمدید نیاز به تأیید دوباره شما دارد.
+            درخواست ثبت شد. قبل از فعال‌سازی، مشخصات زیر را بررسی کنید. بعد از پایان زمان، دسترسی خودکار منقضی می‌شود و تمدید نیاز به تأیید دوباره شما دارد.
           </p>
 
           <dl className="mt-4 space-y-2 text-sm">
@@ -246,7 +267,7 @@ export function CodeReviewAccessFa() {
             <button
               type="button"
               disabled={loading}
-              onClick={approve}
+              onClick={() => void approve()}
               className="flex-1 rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60 dark:bg-white dark:text-slate-950">
               {loading ? 'در حال فعال‌سازی...' : 'تأیید و فعال‌سازی'}
             </button>
@@ -296,8 +317,9 @@ export function CodeReviewAccessFa() {
                 <button
                   type="button"
                   key={item}
+                  disabled={loading}
                   onClick={() => setDuration(item)}
-                  className={`rounded-lg border px-3 py-2 text-sm font-semibold transition ${
+                  className={`rounded-lg border px-3 py-2 text-sm font-semibold transition disabled:opacity-60 ${
                     duration === item
                       ? 'border-slate-900 bg-slate-900 text-white dark:border-white dark:bg-white dark:text-slate-900'
                       : 'border-slate-300 text-slate-700 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-700'
@@ -314,9 +336,10 @@ export function CodeReviewAccessFa() {
 
           <button
             type="button"
-            onClick={requestConfirmation}
-            className="w-full rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-bold text-white transition hover:opacity-90 dark:bg-white dark:text-slate-950">
-            بررسی و ادامه برای تأیید
+            disabled={loading}
+            onClick={() => void requestConfirmation()}
+            className="w-full rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-white dark:text-slate-950">
+            {loading ? 'در حال ثبت درخواست...' : 'بررسی و ادامه برای تأیید'}
           </button>
         </div>
       )}
