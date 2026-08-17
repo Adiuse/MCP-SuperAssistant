@@ -4,9 +4,11 @@ import { notifyCodeReviewDenied } from './codeReviewNotifications.js';
 const logger = createLogger('CodeReviewGate');
 
 const SESSION_STORAGE_KEY = 'mcpCodeReviewSession';
+const PENDING_STORAGE_KEY = 'mcpCodeReviewPendingRequest';
 const AUDIT_STORAGE_KEY = 'mcpCodeReviewAuditLog';
 const MAX_AUDIT_ENTRIES = 500;
 
+export const CODE_REVIEW_REQUEST_TOOL_NAME = 'request_code_review_access';
 export const CODE_REVIEW_ALLOWED_DURATIONS = [5, 10, 20] as const;
 export type CodeReviewDurationMinutes = (typeof CODE_REVIEW_ALLOWED_DURATIONS)[number];
 
@@ -23,10 +25,11 @@ export const CODE_REVIEW_ALLOWED_TOOLS = [
   'get_tag',
   'list_pull_requests',
   'pull_request_read',
-  'search_pull_requests',
 ] as const;
 
 const ALLOWED_TOOL_SET = new Set<string>(CODE_REVIEW_ALLOWED_TOOLS);
+const OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const REPO_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 
 const REPO_SCOPED_TOOLS = new Set<string>([
   'get_file_contents',
@@ -39,7 +42,6 @@ const REPO_SCOPED_TOOLS = new Set<string>([
   'get_tag',
   'list_pull_requests',
   'pull_request_read',
-  'search_pull_requests',
 ]);
 
 const SEARCH_QUERY_TOOLS = new Set<string>(['search_code']);
@@ -62,8 +64,17 @@ export interface CodeReviewSession {
   allowedTools: string[];
 }
 
+export interface PendingCodeReviewRequest {
+  id: string;
+  owner: string;
+  repo: string;
+  durationMinutes: CodeReviewDurationMinutes;
+  requestedAt: number;
+}
+
 export type CodeReviewAuditAction =
   | 'access_requested'
+  | 'access_rejected'
   | 'session_started'
   | 'session_revoked'
   | 'session_expired'
@@ -103,19 +114,37 @@ function normalizePart(value: unknown): string {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
-function createSessionId(): string {
+function createId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }
-  return `review-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function validateRepository(ownerInput: unknown, repoInput: unknown): { owner: string; repo: string } {
+  const owner = typeof ownerInput === 'string' ? ownerInput.trim() : '';
+  const repo = typeof repoInput === 'string' ? repoInput.trim() : '';
+
+  if (!OWNER_PATTERN.test(owner)) {
+    throw new Error('GitHub owner is invalid');
+  }
+  if (!REPO_PATTERN.test(repo) || repo === '.' || repo === '..') {
+    throw new Error('GitHub repository name is invalid');
+  }
+  return { owner, repo };
+}
+
+function validateDuration(value: unknown): CodeReviewDurationMinutes {
+  const duration = Number(value);
+  if (!CODE_REVIEW_ALLOWED_DURATIONS.includes(duration as CodeReviewDurationMinutes)) {
+    throw new Error(`Duration must be one of: ${CODE_REVIEW_ALLOWED_DURATIONS.join(', ')} minutes`);
+  }
+  return duration as CodeReviewDurationMinutes;
 }
 
 function extractSafeResource(args: Record<string, any>): string | undefined {
   const path = typeof args?.path === 'string' ? args.path.trim() : '';
   if (!path) return undefined;
-
-  // Store only a bounded file/tree path for operator visibility. Never persist
-  // query text, source content, tokens, headers, or arbitrary argument values.
   const sanitized = path.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 300);
   return sanitized || undefined;
 }
@@ -159,12 +188,20 @@ export async function clearCodeReviewAuditLog(): Promise<void> {
 
 async function loadStoredSession(): Promise<CodeReviewSession | null> {
   const stored = await chrome.storage.local.get(SESSION_STORAGE_KEY);
-  const session = stored[SESSION_STORAGE_KEY] as CodeReviewSession | undefined;
-  return session || null;
+  return (stored[SESSION_STORAGE_KEY] as CodeReviewSession | undefined) || null;
+}
+
+async function loadPendingRequest(): Promise<PendingCodeReviewRequest | null> {
+  const stored = await chrome.storage.local.get(PENDING_STORAGE_KEY);
+  return (stored[PENDING_STORAGE_KEY] as PendingCodeReviewRequest | undefined) || null;
 }
 
 async function removeStoredSession(): Promise<void> {
   await chrome.storage.local.remove(SESSION_STORAGE_KEY);
+}
+
+async function removePendingRequest(): Promise<void> {
+  await chrome.storage.local.remove(PENDING_STORAGE_KEY);
 }
 
 async function getActiveSessionUnlocked(): Promise<CodeReviewSession | null> {
@@ -191,6 +228,74 @@ export async function getActiveCodeReviewSession(): Promise<CodeReviewSession | 
   return withGateLock(() => getActiveSessionUnlocked());
 }
 
+export async function getPendingCodeReviewRequest(): Promise<PendingCodeReviewRequest | null> {
+  return withGateLock(() => loadPendingRequest());
+}
+
+export async function createPendingCodeReviewRequest(input: {
+  owner: unknown;
+  repo: unknown;
+  durationMinutes: unknown;
+}): Promise<PendingCodeReviewRequest> {
+  return withGateLock(async () => {
+    const active = await getActiveSessionUnlocked();
+    if (active) {
+      throw new Error(`A Code Review session is already active for ${active.owner}/${active.repo}`);
+    }
+
+    const { owner, repo } = validateRepository(input.owner, input.repo);
+    const durationMinutes = validateDuration(input.durationMinutes);
+    const existing = await loadPendingRequest();
+
+    if (existing) {
+      if (
+        normalizePart(existing.owner) === normalizePart(owner) &&
+        normalizePart(existing.repo) === normalizePart(repo) &&
+        existing.durationMinutes === durationMinutes
+      ) {
+        return existing;
+      }
+      throw new Error(`Another access request is already waiting for approval: ${existing.owner}/${existing.repo}`);
+    }
+
+    const request: PendingCodeReviewRequest = {
+      id: createId('request'),
+      owner,
+      repo,
+      durationMinutes,
+      requestedAt: Date.now(),
+    };
+
+    await chrome.storage.local.set({ [PENDING_STORAGE_KEY]: request });
+    await appendAuditLog({
+      timestamp: request.requestedAt,
+      action: 'access_requested',
+      owner,
+      repo,
+      reason: `${durationMinutes} minute read-only Code Review request generated by AI`,
+    });
+
+    return request;
+  });
+}
+
+export async function rejectPendingCodeReviewRequest(reason = 'rejected by user'): Promise<PendingCodeReviewRequest | null> {
+  return withGateLock(async () => {
+    const pending = await loadPendingRequest();
+    await removePendingRequest();
+    if (pending) {
+      await appendAuditLog({
+        timestamp: Date.now(),
+        action: 'access_rejected',
+        owner: pending.owner,
+        repo: pending.repo,
+        reason,
+      });
+    }
+    return pending;
+  });
+}
+
 export async function startCodeReviewSession(input: {
   owner: string;
   repo: string;
@@ -198,37 +303,30 @@ export async function startCodeReviewSession(input: {
   approvedTabId: number;
 }): Promise<CodeReviewSession> {
   return withGateLock(async () => {
-    const owner = input.owner.trim();
-    const repo = input.repo.trim();
-
-    if (!owner || !repo) {
-      throw new Error('Repository owner and name are required');
-    }
+    const { owner, repo } = validateRepository(input.owner, input.repo);
+    const durationMinutes = validateDuration(input.durationMinutes);
 
     if (!Number.isInteger(input.approvedTabId) || input.approvedTabId < 0) {
       throw new Error('A valid browser tab is required to approve code review access');
     }
 
-    if (!CODE_REVIEW_ALLOWED_DURATIONS.includes(input.durationMinutes as CodeReviewDurationMinutes)) {
-      throw new Error(`Duration must be one of: ${CODE_REVIEW_ALLOWED_DURATIONS.join(', ')} minutes`);
-    }
-
     const now = Date.now();
     const session: CodeReviewSession = {
-      id: createSessionId(),
+      id: createId('review'),
       mode: 'code_review',
       owner,
       repo,
       approvedTabId: input.approvedTabId,
       startedAt: now,
-      expiresAt: now + input.durationMinutes * 60_000,
-      durationMinutes: input.durationMinutes as CodeReviewDurationMinutes,
+      expiresAt: now + durationMinutes * 60_000,
+      durationMinutes,
       callCount: 0,
       responseBytes: 0,
       allowedTools: [...CODE_REVIEW_ALLOWED_TOOLS],
     };
 
     await chrome.storage.local.set({ [SESSION_STORAGE_KEY]: session });
+    await removePendingRequest();
     await appendAuditLog({
       timestamp: now,
       action: 'session_started',
@@ -236,7 +334,7 @@ export async function startCodeReviewSession(input: {
       owner,
       repo,
       tabId: input.approvedTabId,
-      reason: `${session.durationMinutes} minute explicit approval`,
+      reason: `${durationMinutes} minute explicit approval`,
     });
 
     logger.debug(`[CodeReviewGate] Started code review session ${session.id} for ${owner}/${repo}`);
@@ -348,14 +446,7 @@ export async function authorizeCodeReviewToolCall(
 
     if (!session) {
       const reason = 'no active code review session';
-      await appendAuditLog({
-        timestamp: Date.now(),
-        action: 'tool_denied',
-        toolName,
-        argKeys,
-        resource,
-        reason,
-      });
+      await appendAuditLog({ timestamp: Date.now(), action: 'tool_denied', toolName, argKeys, resource, reason });
       await notifyCodeReviewDenied(toolName, reason);
       throw new Error('Code review access is OFF. Explicit approval is required.');
     }
@@ -382,15 +473,8 @@ export async function authorizeCodeReviewToolCall(
       const reason = 'session tool-call limit reached; session revoked';
       await removeStoredSession();
       await appendAuditLog({
-        timestamp: Date.now(),
-        action: 'tool_denied',
-        sessionId: session.id,
-        toolName,
-        owner: session.owner,
-        repo: session.repo,
-        argKeys,
-        resource,
-        reason,
+        timestamp: Date.now(), action: 'tool_denied', sessionId: session.id, toolName,
+        owner: session.owner, repo: session.repo, argKeys, resource, reason,
       });
       await notifyCodeReviewDenied(toolName, reason);
       throw new Error('Code Review call limit reached. The session has been revoked.');
@@ -402,37 +486,21 @@ export async function authorizeCodeReviewToolCall(
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       await appendAuditLog({
-        timestamp: Date.now(),
-        action: 'tool_denied',
-        sessionId: session.id,
-        toolName,
-        owner: session.owner,
-        repo: session.repo,
-        tabId: session.approvedTabId,
-        argKeys,
-        resource,
-        reason,
+        timestamp: Date.now(), action: 'tool_denied', sessionId: session.id, toolName,
+        owner: session.owner, repo: session.repo, tabId: session.approvedTabId,
+        argKeys, resource, reason,
       });
       await notifyCodeReviewDenied(toolName, reason);
       throw error;
     }
 
-    const updatedSession: CodeReviewSession = {
-      ...session,
-      callCount: session.callCount + 1,
-    };
-    await chrome.storage.local.set({ [SESSION_STORAGE_KEY]: updatedSession });
+    await chrome.storage.local.set({
+      [SESSION_STORAGE_KEY]: { ...session, callCount: session.callCount + 1 },
+    });
 
     await appendAuditLog({
-      timestamp: Date.now(),
-      action: 'tool_allowed',
-      sessionId: session.id,
-      toolName,
-      owner: session.owner,
-      repo: session.repo,
-      tabId: session.approvedTabId,
-      argKeys,
-      resource,
+      timestamp: Date.now(), action: 'tool_allowed', sessionId: session.id, toolName,
+      owner: session.owner, repo: session.repo, tabId: session.approvedTabId, argKeys, resource,
     });
 
     return sanitizedArgs;
@@ -452,14 +520,8 @@ export async function enforceCodeReviewResultPolicy(toolName: string, result: an
     if (responseBytes > MAX_RESPONSE_BYTES) {
       const reason = `single response exceeded ${MAX_RESPONSE_BYTES} bytes`;
       await appendAuditLog({
-        timestamp: Date.now(),
-        action: 'response_denied',
-        sessionId: session.id,
-        toolName,
-        owner: session.owner,
-        repo: session.repo,
-        responseBytes,
-        reason,
+        timestamp: Date.now(), action: 'response_denied', sessionId: session.id, toolName,
+        owner: session.owner, repo: session.repo, responseBytes, reason,
       });
       await notifyCodeReviewDenied(toolName, reason);
       throw new Error('Tool result is too large for gated Code Review. Request a narrower file/range/query.');
@@ -470,33 +532,20 @@ export async function enforceCodeReviewResultPolicy(toolName: string, result: an
       const reason = 'session response-byte limit reached; session revoked';
       await removeStoredSession();
       await appendAuditLog({
-        timestamp: Date.now(),
-        action: 'response_denied',
-        sessionId: session.id,
-        toolName,
-        owner: session.owner,
-        repo: session.repo,
-        responseBytes,
-        reason,
+        timestamp: Date.now(), action: 'response_denied', sessionId: session.id, toolName,
+        owner: session.owner, repo: session.repo, responseBytes, reason,
       });
       await notifyCodeReviewDenied(toolName, reason);
       throw new Error('Code Review data limit reached. The session has been revoked.');
     }
 
-    const updatedSession: CodeReviewSession = {
-      ...session,
-      responseBytes: nextTotal,
-    };
-    await chrome.storage.local.set({ [SESSION_STORAGE_KEY]: updatedSession });
+    await chrome.storage.local.set({
+      [SESSION_STORAGE_KEY]: { ...session, responseBytes: nextTotal },
+    });
 
     await appendAuditLog({
-      timestamp: Date.now(),
-      action: 'response_allowed',
-      sessionId: session.id,
-      toolName,
-      owner: session.owner,
-      repo: session.repo,
-      responseBytes,
+      timestamp: Date.now(), action: 'response_allowed', sessionId: session.id, toolName,
+      owner: session.owner, repo: session.repo, responseBytes,
     });
 
     return result;
@@ -507,6 +556,34 @@ export async function filterCodeReviewTools<T extends { name: string }>(tools: T
   const session = await getActiveCodeReviewSession();
   if (!session) return [];
   return tools.filter(tool => ALLOWED_TOOL_SET.has(tool.name));
+}
+
+export function getCodeReviewRequestTool() {
+  return {
+    name: CODE_REVIEW_REQUEST_TOOL_NAME,
+    description:
+      'Request temporary read-only GitHub Code Review access from the user. Use this BEFORE attempting any GitHub repository read when no review session is active. This tool does not access GitHub; it only opens an approval request in the local security panel. After the user approves, continue with the GitHub read-only tools.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: {
+          type: 'string',
+          description: 'Exact GitHub repository owner or organization name, for example Adiuse',
+        },
+        repo: {
+          type: 'string',
+          description: 'Exact GitHub repository name, for example MCP-SuperAssistant',
+        },
+        durationMinutes: {
+          type: 'integer',
+          enum: [5, 10, 20],
+          description: 'Requested temporary access duration in minutes. Prefer 5 unless more time is clearly needed.',
+        },
+      },
+      required: ['owner', 'repo', 'durationMinutes'],
+      additionalProperties: false,
+    },
+  };
 }
 
 export async function getCodeReviewAuditLog(): Promise<CodeReviewAuditEntry[]> {
