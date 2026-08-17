@@ -16,9 +16,13 @@ import {
   enforceCodeReviewResultPolicy,
   filterCodeReviewTools,
 } from '../security/codeReviewGate.js';
+import { registerCodeReviewControlBridge } from '../security/codeReviewControlBridge.js';
+
+// Register the explicit-approval control API as soon as the MCP client module is
+// loaded by the background service worker.
+registerCodeReviewControlBridge();
 
 // Export core classes
-
 const logger = createLogger('mcp_client');
 
 export { McpClient, PluginRegistry, EventEmitter };
@@ -66,14 +70,10 @@ async function getGlobalClient(): Promise<McpClient> {
     try {
       globalClient = new McpClient();
       await globalClient.initialize();
-
-      // Set up global event listeners for connection status changes
       setupGlobalClientEventListeners(globalClient);
     } catch (error) {
       logger.error('[getGlobalClient] Failed to initialize client:', error);
-      // Create a fallback client without plugin loading
       globalClient = new McpClient();
-      // Don't initialize to avoid plugin loading issues
       setupGlobalClientEventListeners(globalClient);
     }
   }
@@ -84,18 +84,15 @@ async function getGlobalClient(): Promise<McpClient> {
  * Set up event listeners on the global client to handle connection events
  */
 function setupGlobalClientEventListeners(client: McpClient): void {
-  // Listen for connection status changes and forward them to any registered listeners
   client.on('connection:status-changed', (event) => {
     logger.debug('[Global Client] Connection status changed:', event);
 
-    // Emit a global event that can be caught by the background script
     if (typeof window !== 'undefined' && window.dispatchEvent) {
       window.dispatchEvent(new CustomEvent('mcp:connection-status-changed', {
         detail: event
       }));
     }
 
-    // Also try to broadcast via chrome runtime if available
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
       chrome.runtime.sendMessage({
         type: 'mcp:connection-status-changed',
@@ -138,8 +135,6 @@ function detectTransportType(uri: string): import('./types/plugin.js').Transport
     if (url.protocol === 'ws:' || url.protocol === 'wss:') {
       return 'websocket';
     }
-    // For HTTP/HTTPS, default to SSE (traditional behavior)
-    // Users can manually select streamable-http if desired
     return 'sse';
   } catch {
     return 'sse';
@@ -161,8 +156,6 @@ async function getGatedPrimitives(client: McpClient, forceRefresh: boolean): Pro
   const response = await client.getPrimitives(forceRefresh);
   const tools = await filterCodeReviewTools(response.tools);
 
-  // Code Review mode deliberately exposes tools only. MCP resources and prompts
-  // are hidden because they may provide an alternate path around tool policy.
   const primitives: any[] = [];
   tools.forEach(tool => {
     primitives.push({ type: 'tool', value: tool });
