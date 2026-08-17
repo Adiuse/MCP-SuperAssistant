@@ -12,10 +12,17 @@ import { WebSocketTransport } from './plugins/websocket/WebSocketTransport.js';
 import { DEFAULT_CLIENT_CONFIG } from './types/config.js';
 import { createLogger } from '@extension/shared/lib/logger';
 import {
+  CODE_REVIEW_REQUEST_TOOL_NAME,
   authorizeCodeReviewToolCall,
+  createPendingCodeReviewRequest,
   enforceCodeReviewResultPolicy,
   filterCodeReviewTools,
+  getActiveCodeReviewSession,
+  getCodeReviewRequestTool,
+  getPendingCodeReviewRequest,
+  recordCodeReviewAuditEvent,
 } from '../security/codeReviewGate.js';
+import { notifyCodeReviewAccessRequested } from '../security/codeReviewNotifications.js';
 import { registerCodeReviewControlBridge } from '../security/codeReviewControlBridge.js';
 
 // Register the explicit-approval control API as soon as the MCP client module is
@@ -147,12 +154,61 @@ async function executeGatedToolCall(
   args: { [key: string]: unknown },
   adapterName?: string,
 ): Promise<any> {
+  // This is a local control tool. It never reaches GitHub and is intentionally
+  // available while Code Review access is OFF so the AI can ask the user for
+  // explicit approval using the same MCP tool-call flow documented by the project.
+  if (toolName === CODE_REVIEW_REQUEST_TOOL_NAME) {
+    const existingPending = await getPendingCodeReviewRequest();
+    const request = await createPendingCodeReviewRequest({
+      owner: args?.owner,
+      repo: args?.repo,
+      durationMinutes: args?.durationMinutes,
+    });
+
+    if (!existingPending) {
+      const sent = await notifyCodeReviewAccessRequested(
+        request.owner,
+        request.repo,
+        request.durationMinutes,
+      );
+      await recordCodeReviewAuditEvent({
+        timestamp: Date.now(),
+        action: sent ? 'notification_sent' : 'notification_failed',
+        owner: request.owner,
+        repo: request.repo,
+        reason: 'AI requested Code Review approval',
+      });
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Access request created for ${request.owner}/${request.repo} (${request.durationMinutes} minutes, read-only). Wait for the user to approve or reject it in the local Security Center before attempting GitHub read tools.`,
+        },
+      ],
+      pendingApproval: true,
+      requestId: request.id,
+      owner: request.owner,
+      repo: request.repo,
+      durationMinutes: request.durationMinutes,
+    };
+  }
+
   const sanitizedArgs = await authorizeCodeReviewToolCall(toolName, args || {});
   const result = await client.callTool(toolName, sanitizedArgs, adapterName);
   return await enforceCodeReviewResultPolicy(toolName, result);
 }
 
 async function getGatedPrimitives(client: McpClient, forceRefresh: boolean): Promise<any[]> {
+  const session = await getActiveCodeReviewSession();
+
+  // Access is OFF by default. While OFF, expose only the local approval-request
+  // tool. Do not even enumerate the GitHub MCP server's repository tools.
+  if (!session) {
+    return [{ type: 'tool', value: getCodeReviewRequestTool() }];
+  }
+
   const response = await client.getPrimitives(forceRefresh);
   const tools = await filterCodeReviewTools(response.tools);
 
