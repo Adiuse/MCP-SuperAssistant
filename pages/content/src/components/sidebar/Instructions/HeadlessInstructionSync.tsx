@@ -9,37 +9,95 @@ const logger = createLogger('HeadlessInstructionSync');
 const REVIEW_REQUEST_TOOL = 'request_code_review_access';
 const ALLOWED_DURATIONS = new Set([5, 10, 20]);
 
-function readRenderedParameter(block: HTMLElement, name: string): unknown {
-  const valueElement = block.querySelector<HTMLElement>(`.param-value[data-param-name="${name}"]`);
-  if (!valueElement) return undefined;
+interface ParsedReviewRequest {
+  owner: string;
+  repo: string;
+  durationMinutes: 5 | 10 | 20;
+}
 
-  const rawAttribute = valueElement.getAttribute('data-param-value');
-  if (rawAttribute) {
+function parseJsonObjects(text: string): any[] {
+  const objects: any[] = [];
+  const matches = text.match(/\{[^{}]*\}/gs) || [];
+
+  for (const candidate of matches) {
     try {
-      return JSON.parse(rawAttribute);
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object') objects.push(parsed);
     } catch {
-      // Fall through to the plain-text representation.
+      // Streaming may leave a partial object in the DOM. Ignore it until the
+      // next mutation completes the JSON object.
     }
   }
 
-  const currentValue = valueElement.getAttribute('data-current-value');
-  if (currentValue !== null) return currentValue;
-  return valueElement.textContent?.trim() || undefined;
+  return objects;
+}
+
+function parseReviewRequest(text: string): ParsedReviewRequest | null {
+  if (!text || !/"name"\s*:\s*"request_code_review_access"/.test(text)) return null;
+
+  const objects = parseJsonObjects(text);
+  const start = objects.find(item => item?.type === 'function_call_start' && item?.name === REVIEW_REQUEST_TOOL);
+  if (!start) return null;
+
+  const parameters = new Map<string, unknown>();
+  for (const item of objects) {
+    if (item?.type === 'parameter' && typeof item?.key === 'string') {
+      parameters.set(item.key, item.value);
+    }
+  }
+
+  const ownerValue = parameters.get('owner');
+  const repoValue = parameters.get('repo');
+  const durationValue = Number(parameters.get('durationMinutes'));
+  const owner = typeof ownerValue === 'string' ? ownerValue.trim() : '';
+  const repo = typeof repoValue === 'string' ? repoValue.trim() : '';
+
+  if (!owner || !repo || !ALLOWED_DURATIONS.has(durationValue)) return null;
+
+  return {
+    owner,
+    repo,
+    durationMinutes: durationValue as 5 | 10 | 20,
+  };
+}
+
+async function dispatchReviewRequest(request: ParsedReviewRequest): Promise<void> {
+  const response = await chrome.runtime.sendMessage({
+    type: 'mcp:call-tool',
+    origin: 'content',
+    timestamp: Date.now(),
+    expectResponse: true,
+    payload: {
+      toolName: REVIEW_REQUEST_TOOL,
+      args: request,
+      adapterName: 'security-approval',
+    },
+  });
+
+  if (!response?.success) {
+    throw new Error(response?.error || 'Background rejected the Code Review approval request');
+  }
+
+  // Wake the Persian approval UI immediately instead of waiting for its status poll.
+  window.dispatchEvent(new CustomEvent('code-review:pending-updated'));
 }
 
 /**
  * Keeps MCP instructions generated and synchronized without rendering the old
- * sidebar Instructions UI. It also handles the one safe local control tool
- * (request_code_review_access) automatically: asking for approval must not
- * depend on the generic Auto Execute toggle because this call does not read
- * GitHub or grant access; it only creates a pending local approval request.
+ * sidebar Instructions UI. It also recognizes the single safe local approval
+ * tool directly from the raw ChatGPT <pre> block.
+ *
+ * Important: this does NOT grant GitHub access. It only executes the synthetic
+ * request_code_review_access tool, whose gated implementation creates a local
+ * pending request. GitHub read tools remain unavailable until the user approves.
  */
 export function HeadlessInstructionSync() {
   const { tools } = useAvailableTools();
   const { preferences } = useUserPreferences();
   const { isInitialized, isConnected, refreshTools } = useMcpCommunication();
   const refreshedForConnection = useRef(false);
-  const processedRequestBlocks = useRef<WeakSet<HTMLElement>>(new WeakSet());
+  const processedSources = useRef<WeakSet<HTMLElement>>(new WeakSet());
+  const inFlightKeys = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     if (!isInitialized || !isConnected || refreshedForConnection.current) return;
@@ -60,73 +118,64 @@ export function HeadlessInstructionSync() {
     }
   }, [isConnected]);
 
-  // The generic renderer's Auto Execute path is optional and historically
-  // unreliable for this security-control call. Observe completed rendered
-  // request blocks and dispatch the local request directly through McpClient.
-  // This still traverses background -> executeGatedToolCall, so GitHub remains
-  // inaccessible until the user explicitly approves the pending request.
   useEffect(() => {
     if (!isInitialized || !isConnected) return;
 
     let disposed = false;
+    let scanScheduled = false;
 
-    const tryDispatchRequest = async (block: HTMLElement) => {
-      if (processedRequestBlocks.current.has(block)) return;
+    const processSource = async (source: HTMLElement) => {
+      if (processedSources.current.has(source)) return;
+      if (source.closest('.function-block')) return;
 
-      const functionName = block.querySelector<HTMLElement>('.function-name-text')?.textContent?.trim();
-      if (functionName !== REVIEW_REQUEST_TOOL) return;
+      const request = parseReviewRequest(source.textContent || '');
+      if (!request) return;
 
-      const ownerValue = readRenderedParameter(block, 'owner');
-      const repoValue = readRenderedParameter(block, 'repo');
-      const durationValue = readRenderedParameter(block, 'durationMinutes');
+      const requestKey = `${request.owner.toLowerCase()}/${request.repo.toLowerCase()}:${request.durationMinutes}`;
+      if (inFlightKeys.current.has(requestKey)) return;
 
-      const owner = typeof ownerValue === 'string' ? ownerValue.trim() : '';
-      const repo = typeof repoValue === 'string' ? repoValue.trim() : '';
-      if (!owner || !repo) return;
-
-      const parsedDuration = Number(durationValue);
-      const durationMinutes = ALLOWED_DURATIONS.has(parsedDuration) ? parsedDuration : 5;
-      const mcpClient = (window as any).mcpClient;
-      if (!mcpClient?.isReady?.()) return;
-
-      processedRequestBlocks.current.add(block);
+      processedSources.current.add(source);
+      inFlightKeys.current.add(requestKey);
 
       try {
         logger.debug(
-          `[HeadlessInstructionSync] Dispatching AI approval request for ${owner}/${repo} (${durationMinutes}m)`,
+          `[HeadlessInstructionSync] Dispatching local approval request for ${request.owner}/${request.repo} (${request.durationMinutes}m)`,
         );
-
-        await mcpClient.callTool(REVIEW_REQUEST_TOOL, {
-          owner,
-          repo,
-          durationMinutes,
-        });
-
-        if (!disposed) {
-          block.setAttribute('data-review-request-dispatched', 'true');
-        }
+        await dispatchReviewRequest(request);
+        source.setAttribute('data-review-request-dispatched', 'true');
       } catch (error) {
-        processedRequestBlocks.current.delete(block);
+        processedSources.current.delete(source);
         logger.warn(
-          '[HeadlessInstructionSync] AI approval request dispatch failed:',
+          '[HeadlessInstructionSync] Local approval request dispatch failed:',
           error instanceof Error ? error.message : String(error),
         );
+      } finally {
+        inFlightKeys.current.delete(requestKey);
       }
     };
 
     const scan = () => {
-      document.querySelectorAll<HTMLElement>('.function-block').forEach(block => {
-        void tryDispatchRequest(block);
+      if (disposed) return;
+      document.querySelectorAll<HTMLElement>('pre').forEach(source => {
+        void processSource(source);
+      });
+    };
+
+    const scheduleScan = () => {
+      if (scanScheduled || disposed) return;
+      scanScheduled = true;
+      queueMicrotask(() => {
+        scanScheduled = false;
+        scan();
       });
     };
 
     scan();
-    const observer = new MutationObserver(scan);
-    observer.observe(document.documentElement, {
+    const observer = new MutationObserver(scheduleScan);
+    observer.observe(document.body, {
       childList: true,
       subtree: true,
-      attributes: true,
-      attributeFilter: ['data-current-value', 'data-param-value'],
+      characterData: true,
     });
 
     return () => {
