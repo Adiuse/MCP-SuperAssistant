@@ -85,6 +85,7 @@ export interface CodeReviewAuditEntry {
   tabId?: number;
   responseBytes?: number;
   argKeys?: string[];
+  resource?: string;
 }
 
 let operationQueue: Promise<void> = Promise.resolve();
@@ -107,6 +108,16 @@ function createSessionId(): string {
     return crypto.randomUUID();
   }
   return `review-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function extractSafeResource(args: Record<string, any>): string | undefined {
+  const path = typeof args?.path === 'string' ? args.path.trim() : '';
+  if (!path) return undefined;
+
+  // Store only a bounded file/tree path for operator visibility. Never persist
+  // query text, source content, tokens, headers, or arbitrary argument values.
+  const sanitized = path.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 300);
+  return sanitized || undefined;
 }
 
 async function appendAuditLog(entry: CodeReviewAuditEntry): Promise<void> {
@@ -333,6 +344,7 @@ export async function authorizeCodeReviewToolCall(
   return withGateLock(async () => {
     const session = await getActiveSessionUnlocked();
     const argKeys = Object.keys(args || {}).sort();
+    const resource = extractSafeResource(args || {});
 
     if (!session) {
       const reason = 'no active code review session';
@@ -341,6 +353,7 @@ export async function authorizeCodeReviewToolCall(
         action: 'tool_denied',
         toolName,
         argKeys,
+        resource,
         reason,
       });
       await notifyCodeReviewDenied(toolName, reason);
@@ -358,6 +371,7 @@ export async function authorizeCodeReviewToolCall(
         repo: session.repo,
         tabId: session.approvedTabId,
         argKeys,
+        resource,
         reason,
       });
       await notifyCodeReviewDenied(toolName, reason);
@@ -375,6 +389,7 @@ export async function authorizeCodeReviewToolCall(
         owner: session.owner,
         repo: session.repo,
         argKeys,
+        resource,
         reason,
       });
       await notifyCodeReviewDenied(toolName, reason);
@@ -395,6 +410,7 @@ export async function authorizeCodeReviewToolCall(
         repo: session.repo,
         tabId: session.approvedTabId,
         argKeys,
+        resource,
         reason,
       });
       await notifyCodeReviewDenied(toolName, reason);
@@ -416,6 +432,7 @@ export async function authorizeCodeReviewToolCall(
       repo: session.repo,
       tabId: session.approvedTabId,
       argKeys,
+      resource,
     });
 
     return sanitizedArgs;
