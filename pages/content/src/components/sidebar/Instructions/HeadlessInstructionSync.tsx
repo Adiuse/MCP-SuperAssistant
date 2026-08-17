@@ -6,22 +6,41 @@ import { generateInstructionsJson } from './instructionGeneratorJson';
 import { instructionsState } from './InstructionManager';
 
 const logger = createLogger('HeadlessInstructionSync');
+const REVIEW_REQUEST_TOOL = 'request_code_review_access';
+const ALLOWED_DURATIONS = new Set([5, 10, 20]);
+
+function readRenderedParameter(block: HTMLElement, name: string): unknown {
+  const valueElement = block.querySelector<HTMLElement>(`.param-value[data-param-name="${name}"]`);
+  if (!valueElement) return undefined;
+
+  const rawAttribute = valueElement.getAttribute('data-param-value');
+  if (rawAttribute) {
+    try {
+      return JSON.parse(rawAttribute);
+    } catch {
+      // Fall through to the plain-text representation.
+    }
+  }
+
+  const currentValue = valueElement.getAttribute('data-current-value');
+  if (currentValue !== null) return currentValue;
+  return valueElement.textContent?.trim() || undefined;
+}
 
 /**
  * Keeps MCP instructions generated and synchronized without rendering the old
- * sidebar Instructions UI. The Persian security sidebar remains the only
- * visible sidebar; MCPPopover continues to consume instructionsState exactly
- * as it did before the security redesign.
+ * sidebar Instructions UI. It also handles the one safe local control tool
+ * (request_code_review_access) automatically: asking for approval must not
+ * depend on the generic Auto Execute toggle because this call does not read
+ * GitHub or grant access; it only creates a pending local approval request.
  */
 export function HeadlessInstructionSync() {
   const { tools } = useAvailableTools();
   const { preferences } = useUserPreferences();
   const { isInitialized, isConnected, refreshTools } = useMcpCommunication();
   const refreshedForConnection = useRef(false);
+  const processedRequestBlocks = useRef<WeakSet<HTMLElement>>(new WeakSet());
 
-  // The content-side McpClient already loads tools during startup. This one
-  // guarded refresh closes races where the sidebar mounts before the initial
-  // tool response reaches the Zustand store.
   useEffect(() => {
     if (!isInitialized || !isConnected || refreshedForConnection.current) return;
 
@@ -40,6 +59,81 @@ export function HeadlessInstructionSync() {
       refreshedForConnection.current = false;
     }
   }, [isConnected]);
+
+  // The generic renderer's Auto Execute path is optional and historically
+  // unreliable for this security-control call. Observe completed rendered
+  // request blocks and dispatch the local request directly through McpClient.
+  // This still traverses background -> executeGatedToolCall, so GitHub remains
+  // inaccessible until the user explicitly approves the pending request.
+  useEffect(() => {
+    if (!isInitialized || !isConnected) return;
+
+    let disposed = false;
+
+    const tryDispatchRequest = async (block: HTMLElement) => {
+      if (processedRequestBlocks.current.has(block)) return;
+
+      const functionName = block.querySelector<HTMLElement>('.function-name-text')?.textContent?.trim();
+      if (functionName !== REVIEW_REQUEST_TOOL) return;
+
+      const ownerValue = readRenderedParameter(block, 'owner');
+      const repoValue = readRenderedParameter(block, 'repo');
+      const durationValue = readRenderedParameter(block, 'durationMinutes');
+
+      const owner = typeof ownerValue === 'string' ? ownerValue.trim() : '';
+      const repo = typeof repoValue === 'string' ? repoValue.trim() : '';
+      if (!owner || !repo) return;
+
+      const parsedDuration = Number(durationValue);
+      const durationMinutes = ALLOWED_DURATIONS.has(parsedDuration) ? parsedDuration : 5;
+      const mcpClient = (window as any).mcpClient;
+      if (!mcpClient?.isReady?.()) return;
+
+      processedRequestBlocks.current.add(block);
+
+      try {
+        logger.debug(
+          `[HeadlessInstructionSync] Dispatching AI approval request for ${owner}/${repo} (${durationMinutes}m)`,
+        );
+
+        await mcpClient.callTool(REVIEW_REQUEST_TOOL, {
+          owner,
+          repo,
+          durationMinutes,
+        });
+
+        if (!disposed) {
+          block.setAttribute('data-review-request-dispatched', 'true');
+        }
+      } catch (error) {
+        processedRequestBlocks.current.delete(block);
+        logger.warn(
+          '[HeadlessInstructionSync] AI approval request dispatch failed:',
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    };
+
+    const scan = () => {
+      document.querySelectorAll<HTMLElement>('.function-block').forEach(block => {
+        void tryDispatchRequest(block);
+      });
+    };
+
+    scan();
+    const observer = new MutationObserver(scan);
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-current-value', 'data-param-value'],
+    });
+
+    return () => {
+      disposed = true;
+      observer.disconnect();
+    };
+  }, [isConnected, isInitialized]);
 
   const instructionTools = useMemo(
     () =>
