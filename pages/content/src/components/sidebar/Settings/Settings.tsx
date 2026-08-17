@@ -6,13 +6,14 @@ import { AutomationService } from '@src/services/automation.service';
 import { cn } from '@src/lib/utils';
 import { createLogger } from '@extension/shared/lib/logger';
 import { CodeReviewAccessFa } from '../../CodeReviewAccessFa';
+import { SecurityCenterFa } from '../../SecurityCenterFa';
 
 const logger = createLogger('Settings');
 
 const DEFAULT_DELAYS = {
   autoInsertDelay: 2,
   autoSubmitDelay: 2,
-  autoExecuteDelay: 2
+  autoExecuteDelay: 2,
 } as const;
 
 const Settings: React.FC = () => {
@@ -27,7 +28,7 @@ const Settings: React.FC = () => {
       const storedDelays = JSON.parse(localStorage.getItem('mcpDelaySettings') || '{}');
       localStorage.setItem('mcpDelaySettings', JSON.stringify({
         ...storedDelays,
-        [`${type}Delay`]: delay
+        [`${type}Delay`]: delay,
       }));
     } catch (error) {
       logger.error('[Settings] Error storing delay settings:', error);
@@ -52,26 +53,9 @@ const Settings: React.FC = () => {
   }, [updatePreferences]);
 
   return (
-    <div className="p-4 space-y-4">
-      <CodeReviewAccessFa
-        owner=""
-        repo=""
-        onApprove={async (duration) => {
-          await chrome.runtime.sendMessage({
-            type: 'code-review:approve',
-            payload: {
-              owner: '',
-              repo: '',
-              durationMinutes: duration,
-            },
-          });
-        }}
-        onRevoke={async () => {
-          await chrome.runtime.sendMessage({
-            type: 'code-review:revoke',
-          });
-        }}
-      />
+    <div className="space-y-4 p-4">
+      <CodeReviewAccessFa />
+      <SecurityCenterFa />
 
       <Card className="border-slate-200 dark:border-slate-700 dark:bg-slate-800">
         <CardContent className="p-4">
@@ -79,20 +63,20 @@ const Settings: React.FC = () => {
             Automation Delay Settings
           </Typography>
           <div className="space-y-4">
-            {(['autoInsert','autoSubmit','autoExecute'] as const).map(type => (
+            {(['autoInsert', 'autoSubmit', 'autoExecute'] as const).map(type => (
               <div key={type}>
-                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
+                <label className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">
                   {type} Delay (seconds)
                 </label>
                 <input
                   type="number"
                   min="0"
                   value={preferences[`${type}Delay`] || 0}
-                  onChange={(e) => handleDelayChange(type, e.target.value)}
+                  onChange={event => handleDelayChange(type, event.target.value)}
                   className={cn(
-                    'w-full p-2 text-sm border rounded-md',
+                    'w-full rounded-md border p-2 text-sm',
                     'bg-white dark:bg-slate-900',
-                    'border-slate-300 dark:border-slate-600'
+                    'border-slate-300 dark:border-slate-600',
                   )}
                 />
               </div>
