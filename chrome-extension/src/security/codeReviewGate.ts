@@ -1,4 +1,5 @@
 import { createLogger } from '@extension/shared/lib/logger';
+import { notifyCodeReviewDenied } from './codeReviewNotifications.js';
 
 const logger = createLogger('CodeReviewGate');
 
@@ -9,12 +10,6 @@ const MAX_AUDIT_ENTRIES = 500;
 export const CODE_REVIEW_ALLOWED_DURATIONS = [5, 10, 20] as const;
 export type CodeReviewDurationMinutes = (typeof CODE_REVIEW_ALLOWED_DURATIONS)[number];
 
-/**
- * Deliberately small, read-only tool surface for GitHub MCP code review.
- *
- * IMPORTANT: this is an allowlist, not a denylist. Any newly-added GitHub MCP
- * tool is denied by default until it is explicitly reviewed and added here.
- */
 export const CODE_REVIEW_ALLOWED_TOOLS = [
   'get_me',
   'get_file_contents',
@@ -49,11 +44,9 @@ const REPO_SCOPED_TOOLS = new Set<string>([
 
 const SEARCH_QUERY_TOOLS = new Set<string>(['search_code']);
 
-// Egress / abuse limits. These protect a short review session from becoming a
-// bulk-export channel while still allowing a normal multi-file E2E review.
 const MAX_TOOL_CALLS_PER_SESSION = 200;
-const MAX_RESPONSE_BYTES = 2 * 1024 * 1024; // 2 MiB per response
-const MAX_TOTAL_RESPONSE_BYTES = 25 * 1024 * 1024; // 25 MiB per session
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_TOTAL_RESPONSE_BYTES = 25 * 1024 * 1024;
 
 export interface CodeReviewSession {
   id: string;
@@ -69,16 +62,21 @@ export interface CodeReviewSession {
   allowedTools: string[];
 }
 
+export type CodeReviewAuditAction =
+  | 'access_requested'
+  | 'session_started'
+  | 'session_revoked'
+  | 'session_expired'
+  | 'tool_allowed'
+  | 'tool_denied'
+  | 'response_allowed'
+  | 'response_denied'
+  | 'notification_sent'
+  | 'notification_failed';
+
 export interface CodeReviewAuditEntry {
   timestamp: number;
-  action:
-    | 'session_started'
-    | 'session_revoked'
-    | 'session_expired'
-    | 'tool_allowed'
-    | 'tool_denied'
-    | 'response_allowed'
-    | 'response_denied';
+  action: CodeReviewAuditAction;
   sessionId?: string;
   toolName?: string;
   owner?: string;
@@ -86,6 +84,7 @@ export interface CodeReviewAuditEntry {
   reason?: string;
   tabId?: number;
   responseBytes?: number;
+  argKeys?: string[];
 }
 
 let operationQueue: Promise<void> = Promise.resolve();
@@ -121,6 +120,32 @@ async function appendAuditLog(entry: CodeReviewAuditEntry): Promise<void> {
   }
 }
 
+export async function recordCodeReviewAuditEvent(entry: CodeReviewAuditEntry): Promise<void> {
+  await withGateLock(() => appendAuditLog(entry));
+}
+
+export async function recordCodeReviewAccessRequest(input: {
+  owner: string;
+  repo: string;
+  durationMinutes: number;
+  tabId?: number;
+}): Promise<void> {
+  await recordCodeReviewAuditEvent({
+    timestamp: Date.now(),
+    action: 'access_requested',
+    owner: input.owner.trim(),
+    repo: input.repo.trim(),
+    tabId: input.tabId,
+    reason: `${input.durationMinutes} minute read-only Code Review request`,
+  });
+}
+
+export async function clearCodeReviewAuditLog(): Promise<void> {
+  await withGateLock(async () => {
+    await chrome.storage.local.remove(AUDIT_STORAGE_KEY);
+  });
+}
+
 async function loadStoredSession(): Promise<CodeReviewSession | null> {
   const stored = await chrome.storage.local.get(SESSION_STORAGE_KEY);
   const session = stored[SESSION_STORAGE_KEY] as CodeReviewSession | undefined;
@@ -133,9 +158,7 @@ async function removeStoredSession(): Promise<void> {
 
 async function getActiveSessionUnlocked(): Promise<CodeReviewSession | null> {
   const session = await loadStoredSession();
-  if (!session) {
-    return null;
-  }
+  if (!session) return null;
 
   if (Date.now() >= session.expiresAt) {
     await removeStoredSession();
@@ -194,8 +217,6 @@ export async function startCodeReviewSession(input: {
       allowedTools: [...CODE_REVIEW_ALLOWED_TOOLS],
     };
 
-    // Starting a new session always replaces any previous session. There is no
-    // auto-renew and no extension of the previous expiry time.
     await chrome.storage.local.set({ [SESSION_STORAGE_KEY]: session });
     await appendAuditLog({
       timestamp: now,
@@ -212,8 +233,8 @@ export async function startCodeReviewSession(input: {
   });
 }
 
-export async function revokeCodeReviewSession(reason = 'manual revoke'): Promise<void> {
-  await withGateLock(async () => {
+export async function revokeCodeReviewSession(reason = 'manual revoke'): Promise<CodeReviewSession | null> {
+  return withGateLock(async () => {
     const session = await loadStoredSession();
     await removeStoredSession();
 
@@ -226,6 +247,8 @@ export async function revokeCodeReviewSession(reason = 'manual revoke'): Promise
       tabId: session?.approvedTabId,
       reason,
     });
+
+    return session;
   });
 }
 
@@ -237,6 +260,7 @@ export async function assertApprovedTab(tabId: number | undefined): Promise<Code
     }
 
     if (tabId === undefined || session.approvedTabId !== tabId) {
+      const reason = 'request came from a tab that was not explicitly approved';
       await appendAuditLog({
         timestamp: Date.now(),
         action: 'tool_denied',
@@ -244,8 +268,9 @@ export async function assertApprovedTab(tabId: number | undefined): Promise<Code
         owner: session.owner,
         repo: session.repo,
         tabId,
-        reason: 'request came from a tab that was not explicitly approved',
+        reason,
       });
+      await notifyCodeReviewDenied('tab_scope', reason);
       throw new Error('This Code Review session is locked to the browser tab that approved it.');
     }
 
@@ -258,14 +283,10 @@ function sanitizeSearchCodeQuery(query: unknown, session: CodeReviewSession): st
     throw new Error('search_code requires a non-empty query');
   }
 
-  // The gate owns repository scoping. Reject caller-provided scope qualifiers
-  // instead of attempting to merge them, which avoids OR/NOT scope bypasses.
   if (/\b(?:repo|org|user):/i.test(query)) {
     throw new Error('Repository/org/user scope qualifiers are managed by the Code Review gate');
   }
 
-  // OR can change the effective scope of GitHub search expressions. Multiple
-  // narrow searches are preferred during a security-gated review session.
   if (/\bOR\b/i.test(query)) {
     throw new Error('OR queries are disabled in gated Code Review search; use separate searches instead');
   }
@@ -285,9 +306,7 @@ function enforceRepoScope(
     return nextArgs;
   }
 
-  if (!REPO_SCOPED_TOOLS.has(toolName)) {
-    return nextArgs;
-  }
+  if (!REPO_SCOPED_TOOLS.has(toolName)) return nextArgs;
 
   const requestedOwner = normalizePart(nextArgs.owner);
   const requestedRepo = normalizePart(nextArgs.repo);
@@ -302,34 +321,34 @@ function enforceRepoScope(
     throw new Error(`Repository scope violation: repo '${nextArgs.repo}' is not approved`);
   }
 
-  // Fill missing scope automatically, but never permit a different scope.
   nextArgs.owner = session.owner;
   nextArgs.repo = session.repo;
   return nextArgs;
 }
 
-/**
- * Performs fail-closed authorization and returns sanitized tool arguments.
- * Call this immediately before invoking an MCP tool.
- */
 export async function authorizeCodeReviewToolCall(
   toolName: string,
   args: Record<string, any>,
 ): Promise<Record<string, any>> {
   return withGateLock(async () => {
     const session = await getActiveSessionUnlocked();
+    const argKeys = Object.keys(args || {}).sort();
 
     if (!session) {
+      const reason = 'no active code review session';
       await appendAuditLog({
         timestamp: Date.now(),
         action: 'tool_denied',
         toolName,
-        reason: 'no active code review session',
+        argKeys,
+        reason,
       });
+      await notifyCodeReviewDenied(toolName, reason);
       throw new Error('Code review access is OFF. Explicit approval is required.');
     }
 
     if (!ALLOWED_TOOL_SET.has(toolName)) {
+      const reason = 'tool is not in the code review allowlist';
       await appendAuditLog({
         timestamp: Date.now(),
         action: 'tool_denied',
@@ -338,12 +357,15 @@ export async function authorizeCodeReviewToolCall(
         owner: session.owner,
         repo: session.repo,
         tabId: session.approvedTabId,
-        reason: 'tool is not in the code review allowlist',
+        argKeys,
+        reason,
       });
+      await notifyCodeReviewDenied(toolName, reason);
       throw new Error(`Tool '${toolName}' is blocked by Code Review policy`);
     }
 
     if (session.callCount >= MAX_TOOL_CALLS_PER_SESSION) {
+      const reason = 'session tool-call limit reached; session revoked';
       await removeStoredSession();
       await appendAuditLog({
         timestamp: Date.now(),
@@ -352,8 +374,10 @@ export async function authorizeCodeReviewToolCall(
         toolName,
         owner: session.owner,
         repo: session.repo,
-        reason: 'session tool-call limit reached; session revoked',
+        argKeys,
+        reason,
       });
+      await notifyCodeReviewDenied(toolName, reason);
       throw new Error('Code Review call limit reached. The session has been revoked.');
     }
 
@@ -361,6 +385,7 @@ export async function authorizeCodeReviewToolCall(
     try {
       sanitizedArgs = enforceRepoScope(toolName, args || {}, session);
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
       await appendAuditLog({
         timestamp: Date.now(),
         action: 'tool_denied',
@@ -369,8 +394,10 @@ export async function authorizeCodeReviewToolCall(
         owner: session.owner,
         repo: session.repo,
         tabId: session.approvedTabId,
-        reason: error instanceof Error ? error.message : String(error),
+        argKeys,
+        reason,
       });
+      await notifyCodeReviewDenied(toolName, reason);
       throw error;
     }
 
@@ -388,15 +415,13 @@ export async function authorizeCodeReviewToolCall(
       owner: session.owner,
       repo: session.repo,
       tabId: session.approvedTabId,
+      argKeys,
     });
 
     return sanitizedArgs;
   });
 }
 
-/**
- * Limits how much tool output can actually be returned to the AI.
- */
 export async function enforceCodeReviewResultPolicy(toolName: string, result: any): Promise<any> {
   const serialized = JSON.stringify(result ?? null);
   const responseBytes = new TextEncoder().encode(serialized).byteLength;
@@ -408,6 +433,7 @@ export async function enforceCodeReviewResultPolicy(toolName: string, result: an
     }
 
     if (responseBytes > MAX_RESPONSE_BYTES) {
+      const reason = `single response exceeded ${MAX_RESPONSE_BYTES} bytes`;
       await appendAuditLog({
         timestamp: Date.now(),
         action: 'response_denied',
@@ -416,13 +442,15 @@ export async function enforceCodeReviewResultPolicy(toolName: string, result: an
         owner: session.owner,
         repo: session.repo,
         responseBytes,
-        reason: `single response exceeded ${MAX_RESPONSE_BYTES} bytes`,
+        reason,
       });
+      await notifyCodeReviewDenied(toolName, reason);
       throw new Error('Tool result is too large for gated Code Review. Request a narrower file/range/query.');
     }
 
     const nextTotal = session.responseBytes + responseBytes;
     if (nextTotal > MAX_TOTAL_RESPONSE_BYTES) {
+      const reason = 'session response-byte limit reached; session revoked';
       await removeStoredSession();
       await appendAuditLog({
         timestamp: Date.now(),
@@ -432,8 +460,9 @@ export async function enforceCodeReviewResultPolicy(toolName: string, result: an
         owner: session.owner,
         repo: session.repo,
         responseBytes,
-        reason: 'session response-byte limit reached; session revoked',
+        reason,
       });
+      await notifyCodeReviewDenied(toolName, reason);
       throw new Error('Code Review data limit reached. The session has been revoked.');
     }
 
@@ -459,9 +488,7 @@ export async function enforceCodeReviewResultPolicy(toolName: string, result: an
 
 export async function filterCodeReviewTools<T extends { name: string }>(tools: T[]): Promise<T[]> {
   const session = await getActiveCodeReviewSession();
-  if (!session) {
-    return [];
-  }
+  if (!session) return [];
   return tools.filter(tool => ALLOWED_TOOL_SET.has(tool.name));
 }
 
