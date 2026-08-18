@@ -327,16 +327,21 @@ export function HeadlessInstructionSync() {
       const sessionId = session.id;
       if (!sessionId || currentTabId === undefined || session.approvedTabId !== currentTabId) return;
       if (resumeInFlightSessions.has(sessionId)) return;
-      if (await hasResumeMarker(sessionId)) return;
 
-      const previousAttempt = resumeAttempts.get(sessionId);
-      if (previousAttempt && (previousAttempt.count >= 3 || Date.now() < previousAttempt.nextAt)) return;
-
-      const attemptCount = (previousAttempt?.count || 0) + 1;
-      resumeAttempts.set(sessionId, { count: attemptCount, nextAt: Date.now() + attemptCount * 2000 });
+      // Claim the session synchronously before the first await so duplicate
+      // HeadlessInstructionSync mounts cannot both pass the marker check.
       resumeInFlightSessions.add(sessionId);
+      let attemptCount = 0;
 
       try {
+        if (await hasResumeMarker(sessionId)) return;
+
+        const previousAttempt = resumeAttempts.get(sessionId);
+        if (previousAttempt && (previousAttempt.count >= 3 || Date.now() < previousAttempt.nextAt)) return;
+
+        attemptCount = (previousAttempt?.count || 0) + 1;
+        resumeAttempts.set(sessionId, { count: attemptCount, nextAt: Date.now() + attemptCount * 2000 });
+
         const currentTools = preferredTools || (await refreshTools(true));
         const hasReadTools = currentTools.some(tool => tool?.name && READ_TOOL_NAMES.has(tool.name));
         if (!hasReadTools) {
@@ -372,7 +377,7 @@ export function HeadlessInstructionSync() {
         });
       } catch (error) {
         emitSecurityToast({
-          id: `review-resume-failed:${sessionId}:${attemptCount}`,
+          id: `review-resume-failed:${sessionId}:${attemptCount || 1}`,
           title: 'ادامه خودکار Code Review ناموفق بود',
           message: error instanceof Error ? error.message : String(error),
           variant: 'warning',
@@ -435,8 +440,6 @@ export function HeadlessInstructionSync() {
         let refreshedTools: Array<{ name?: string }> | undefined;
 
         if (session && !sessionIsForThisTab) {
-          // Legacy background broadcasts are global. Do not let a read-tool list
-          // from another tab leak into this chat's model instructions.
           if (currentTools.length > 0) {
             setAvailableTools([]);
             toolsRef.current = [];
