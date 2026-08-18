@@ -7,6 +7,7 @@ const SESSION_STORAGE_KEY = 'mcpCodeReviewSession';
 const PENDING_STORAGE_KEY = 'mcpCodeReviewPendingRequest';
 const AUDIT_STORAGE_KEY = 'mcpCodeReviewAuditLog';
 const MAX_AUDIT_ENTRIES = 500;
+const MAX_PENDING_REQUESTS = 100;
 
 export const CODE_REVIEW_REQUEST_TOOL_NAME = 'request_code_review_access';
 export const CODE_REVIEW_ALLOWED_DURATIONS = [5, 10, 20] as const;
@@ -70,6 +71,8 @@ export interface PendingCodeReviewRequest {
   repo: string;
   durationMinutes: CodeReviewDurationMinutes;
   requestedAt: number;
+  sourceKey?: string;
+  sourcePath?: string;
 }
 
 export type CodeReviewAuditAction =
@@ -142,6 +145,12 @@ function validateDuration(value: unknown): CodeReviewDurationMinutes {
   return duration as CodeReviewDurationMinutes;
 }
 
+function sanitizeOptionalString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const clean = value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, maxLength);
+  return clean || undefined;
+}
+
 function extractSafeResource(args: Record<string, any>): string | undefined {
   const path = typeof args?.path === 'string' ? args.path.trim() : '';
   if (!path) return undefined;
@@ -191,17 +200,32 @@ async function loadStoredSession(): Promise<CodeReviewSession | null> {
   return (stored[SESSION_STORAGE_KEY] as CodeReviewSession | undefined) || null;
 }
 
-async function loadPendingRequest(): Promise<PendingCodeReviewRequest | null> {
+async function loadPendingRequests(): Promise<PendingCodeReviewRequest[]> {
   const stored = await chrome.storage.local.get(PENDING_STORAGE_KEY);
-  return (stored[PENDING_STORAGE_KEY] as PendingCodeReviewRequest | undefined) || null;
+  const raw = stored[PENDING_STORAGE_KEY];
+
+  if (Array.isArray(raw)) {
+    return raw.filter(item => item && typeof item === 'object' && typeof item.id === 'string') as PendingCodeReviewRequest[];
+  }
+
+  // Backwards-compatible migration from the old single pending object.
+  if (raw && typeof raw === 'object' && typeof raw.id === 'string') {
+    return [raw as PendingCodeReviewRequest];
+  }
+
+  return [];
+}
+
+async function savePendingRequests(requests: PendingCodeReviewRequest[]): Promise<void> {
+  if (requests.length === 0) {
+    await chrome.storage.local.remove(PENDING_STORAGE_KEY);
+    return;
+  }
+  await chrome.storage.local.set({ [PENDING_STORAGE_KEY]: requests.slice(-MAX_PENDING_REQUESTS) });
 }
 
 async function removeStoredSession(): Promise<void> {
   await chrome.storage.local.remove(SESSION_STORAGE_KEY);
-}
-
-async function removePendingRequest(): Promise<void> {
-  await chrome.storage.local.remove(PENDING_STORAGE_KEY);
 }
 
 async function getActiveSessionUnlocked(): Promise<CodeReviewSession | null> {
@@ -228,14 +252,21 @@ export async function getActiveCodeReviewSession(): Promise<CodeReviewSession | 
   return withGateLock(() => getActiveSessionUnlocked());
 }
 
+export async function getPendingCodeReviewRequests(): Promise<PendingCodeReviewRequest[]> {
+  return withGateLock(() => loadPendingRequests());
+}
+
+// Backwards compatibility for older callers that only understand one pending request.
 export async function getPendingCodeReviewRequest(): Promise<PendingCodeReviewRequest | null> {
-  return withGateLock(() => loadPendingRequest());
+  return withGateLock(async () => (await loadPendingRequests())[0] || null);
 }
 
 export async function createPendingCodeReviewRequest(input: {
   owner: unknown;
   repo: unknown;
   durationMinutes: unknown;
+  sourceKey?: unknown;
+  sourcePath?: unknown;
 }): Promise<PendingCodeReviewRequest> {
   return withGateLock(async () => {
     const active = await getActiveSessionUnlocked();
@@ -245,18 +276,21 @@ export async function createPendingCodeReviewRequest(input: {
 
     const { owner, repo } = validateRepository(input.owner, input.repo);
     const durationMinutes = validateDuration(input.durationMinutes);
-    const existing = await loadPendingRequest();
+    const sourceKey = sanitizeOptionalString(input.sourceKey, 500);
+    const sourcePath = sanitizeOptionalString(input.sourcePath, 500);
+    const existingRequests = await loadPendingRequests();
 
-    if (existing) {
-      if (
-        normalizePart(existing.owner) === normalizePart(owner) &&
-        normalizePart(existing.repo) === normalizePart(repo) &&
-        existing.durationMinutes === durationMinutes
-      ) {
-        return existing;
-      }
-      throw new Error(`Another access request is already waiting for approval: ${existing.owner}/${existing.repo}`);
-    }
+    const existing = sourceKey
+      ? existingRequests.find(request => request.sourceKey === sourceKey)
+      : existingRequests.find(
+          request =>
+            !request.sourceKey &&
+            normalizePart(request.owner) === normalizePart(owner) &&
+            normalizePart(request.repo) === normalizePart(repo) &&
+            request.durationMinutes === durationMinutes,
+        );
+
+    if (existing) return existing;
 
     const request: PendingCodeReviewRequest = {
       id: createId('request'),
@@ -264,9 +298,11 @@ export async function createPendingCodeReviewRequest(input: {
       repo,
       durationMinutes,
       requestedAt: Date.now(),
+      sourceKey,
+      sourcePath,
     };
 
-    await chrome.storage.local.set({ [PENDING_STORAGE_KEY]: request });
+    await savePendingRequests([...existingRequests, request]);
     await appendAuditLog({
       timestamp: request.requestedAt,
       action: 'access_requested',
@@ -279,20 +315,24 @@ export async function createPendingCodeReviewRequest(input: {
   });
 }
 
-export async function rejectPendingCodeReviewRequest(reason = 'rejected by user'): Promise<PendingCodeReviewRequest | null> {
+export async function rejectPendingCodeReviewRequest(
+  reason = 'rejected by user',
+  requestId?: string,
+): Promise<PendingCodeReviewRequest | null> {
   return withGateLock(async () => {
-    const pending = await loadPendingRequest();
-    await removePendingRequest();
-    if (pending) {
-      await appendAuditLog({
-        timestamp: Date.now(),
-        action: 'access_rejected',
-        owner: pending.owner,
-        repo: pending.repo,
-        reason,
-      });
-    }
-    return pending;
+    const requests = await loadPendingRequests();
+    const target = requestId ? requests.find(request => request.id === requestId) : requests[0];
+    if (!target) return null;
+
+    await savePendingRequests(requests.filter(request => request.id !== target.id));
+    await appendAuditLog({
+      timestamp: Date.now(),
+      action: 'access_rejected',
+      owner: target.owner,
+      repo: target.repo,
+      reason,
+    });
+    return target;
   });
 }
 
@@ -301,13 +341,41 @@ export async function startCodeReviewSession(input: {
   repo: string;
   durationMinutes: number;
   approvedTabId: number;
+  requestId?: string;
 }): Promise<CodeReviewSession> {
   return withGateLock(async () => {
+    const active = await getActiveSessionUnlocked();
+    if (active) {
+      throw new Error(`A Code Review session is already active for ${active.owner}/${active.repo}`);
+    }
+
     const { owner, repo } = validateRepository(input.owner, input.repo);
     const durationMinutes = validateDuration(input.durationMinutes);
 
     if (!Number.isInteger(input.approvedTabId) || input.approvedTabId < 0) {
       throw new Error('A valid browser tab is required to approve code review access');
+    }
+
+    const pendingRequests = await loadPendingRequests();
+    const pending = input.requestId
+      ? pendingRequests.find(request => request.id === input.requestId)
+      : pendingRequests.find(
+          request =>
+            normalizePart(request.owner) === normalizePart(owner) &&
+            normalizePart(request.repo) === normalizePart(repo) &&
+            request.durationMinutes === durationMinutes,
+        );
+
+    if (!pending) {
+      throw new Error('The selected Code Review request is no longer pending');
+    }
+
+    if (
+      normalizePart(pending.owner) !== normalizePart(owner) ||
+      normalizePart(pending.repo) !== normalizePart(repo) ||
+      pending.durationMinutes !== durationMinutes
+    ) {
+      throw new Error('Approval payload does not match the selected pending request');
     }
 
     const now = Date.now();
@@ -326,7 +394,7 @@ export async function startCodeReviewSession(input: {
     };
 
     await chrome.storage.local.set({ [SESSION_STORAGE_KEY]: session });
-    await removePendingRequest();
+    await savePendingRequests(pendingRequests.filter(request => request.id !== pending.id));
     await appendAuditLog({
       timestamp: now,
       action: 'session_started',
