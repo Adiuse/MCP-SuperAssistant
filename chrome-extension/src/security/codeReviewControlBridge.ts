@@ -23,6 +23,8 @@ import {
 import { createLogger } from '@extension/shared/lib/logger';
 
 const logger = createLogger('CodeReviewControlBridge');
+const CALLER_CONTEXT_TTL_MS = 30_000;
+const MAX_CALLER_CONTEXTS = 500;
 
 export const CODE_REVIEW_CONTROL_MESSAGES = {
   STATUS: 'code-review:get-status',
@@ -36,7 +38,87 @@ export const CODE_REVIEW_CONTROL_MESSAGES = {
   CLEAR_AUDIT: 'code-review:clear-audit',
 } as const;
 
+export interface CodeReviewCallerContext {
+  tabId: number;
+  sourceUrl?: string;
+  capturedAt: number;
+}
+
 let bridgeRegistered = false;
+const callerContextQueues = new Map<string, CodeReviewCallerContext[]>();
+
+function stableSerialize(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(',')}]`;
+
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map(key => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
+    .join(',')}}`;
+}
+
+function callerContextKey(toolName: string, args: unknown): string {
+  return `${toolName}|${stableSerialize(args || {})}`;
+}
+
+function pruneCallerContexts(): void {
+  const cutoff = Date.now() - CALLER_CONTEXT_TTL_MS;
+  let total = 0;
+
+  for (const [key, queue] of callerContextQueues) {
+    const fresh = queue.filter(item => item.capturedAt >= cutoff);
+    if (fresh.length === 0) {
+      callerContextQueues.delete(key);
+      continue;
+    }
+    callerContextQueues.set(key, fresh);
+    total += fresh.length;
+  }
+
+  if (total <= MAX_CALLER_CONTEXTS) return;
+
+  const all = [...callerContextQueues.entries()]
+    .flatMap(([key, queue]) => queue.map(item => ({ key, item })))
+    .sort((a, b) => a.item.capturedAt - b.item.capturedAt);
+
+  for (const entry of all.slice(0, total - MAX_CALLER_CONTEXTS)) {
+    const queue = callerContextQueues.get(entry.key);
+    if (!queue) continue;
+    const index = queue.indexOf(entry.item);
+    if (index >= 0) queue.splice(index, 1);
+    if (queue.length === 0) callerContextQueues.delete(entry.key);
+  }
+}
+
+function captureCodeReviewCallerContext(
+  toolName: string,
+  args: unknown,
+  sender: chrome.runtime.MessageSender,
+): void {
+  const tabId = sender.tab?.id;
+  if (tabId === undefined) return;
+
+  pruneCallerContexts();
+  const key = callerContextKey(toolName, args);
+  const queue = callerContextQueues.get(key) || [];
+  queue.push({ tabId, sourceUrl: sender.tab?.url, capturedAt: Date.now() });
+  callerContextQueues.set(key, queue);
+}
+
+export function consumeCodeReviewCallerContext(
+  toolName: string,
+  args: unknown,
+): CodeReviewCallerContext | null {
+  pruneCallerContexts();
+  const key = callerContextKey(toolName, args);
+  const queue = callerContextQueues.get(key);
+  if (!queue || queue.length === 0) return null;
+
+  const context = queue.shift() || null;
+  if (queue.length === 0) callerContextQueues.delete(key);
+  return context;
+}
 
 function readSettingsPayload(message: any): { owner: string; repo: string; durationMinutes: number } {
   const owner = typeof message.payload?.owner === 'string' ? message.payload.owner.trim() : '';
@@ -102,6 +184,18 @@ export function registerCodeReviewControlBridge(): void {
   });
 
   chrome.runtime.onMessage.addListener((message: any, sender, sendResponse) => {
+    // This listener is registered while the MCP module is imported, before the
+    // legacy background MCP handler. Capture trusted sender metadata here so the
+    // gated execution layer can consume the real tab context without trusting
+    // model-provided arguments.
+    if (message?.type === 'mcp:call-tool') {
+      const toolName = message.payload?.toolName;
+      if (typeof toolName === 'string' && toolName) {
+        captureCodeReviewCallerContext(toolName, message.payload?.args || {}, sender);
+      }
+      return false;
+    }
+
     if (!message || typeof message.type !== 'string' || !message.type.startsWith('code-review:')) return false;
 
     const run = async () => {
@@ -222,9 +316,6 @@ export function registerCodeReviewControlBridge(): void {
         case CODE_REVIEW_CONTROL_MESSAGES.REVOKE: {
           if (sender.tab?.id === undefined) throw new Error('لغو دسترسی فقط از داخل تب مرورگر مجاز است.');
 
-          // Revocation is deliberately global and can be issued from any open
-          // conversation. Restricting a destructive security action to the
-          // original tab would force the user to hunt through chat history.
           const revoked = await revokeCodeReviewSession('manual global revoke from Persian Code Review UI');
           await clearCodeReviewExpiryNotification();
           const sent = await notifyCodeReviewRevoked(revoked?.owner, revoked?.repo);
