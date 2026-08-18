@@ -4,7 +4,7 @@ import {
   createPendingCodeReviewRequest,
   getActiveCodeReviewSession,
   getCodeReviewAuditLog,
-  getPendingCodeReviewRequest,
+  getPendingCodeReviewRequests,
   recordCodeReviewAuditEvent,
   rejectPendingCodeReviewRequest,
   revokeCodeReviewSession,
@@ -50,6 +50,22 @@ function readRequestPayload(message: any): { owner: string; repo: string; durati
   return { owner, repo, durationMinutes };
 }
 
+function readRequestId(message: any): string {
+  const requestId = typeof message.payload?.requestId === 'string' ? message.payload.requestId.trim() : '';
+  if (!requestId) throw new Error('شناسه درخواست دسترسی الزامی است.');
+  return requestId;
+}
+
+function safeSourcePath(url?: string): string | undefined {
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url);
+    return `${parsed.pathname}${parsed.search}`.slice(0, 500);
+  } catch {
+    return undefined;
+  }
+}
+
 async function auditNotificationResult(input: {
   sent: boolean;
   sessionId?: string;
@@ -70,10 +86,7 @@ async function auditNotificationResult(input: {
 }
 
 export function registerCodeReviewControlBridge(): void {
-  if (bridgeRegistered || typeof chrome === 'undefined' || !chrome.runtime?.onMessage) {
-    return;
-  }
-
+  if (bridgeRegistered || typeof chrome === 'undefined' || !chrome.runtime?.onMessage) return;
   bridgeRegistered = true;
 
   registerCodeReviewNotificationListeners(async event => {
@@ -88,62 +101,58 @@ export function registerCodeReviewControlBridge(): void {
   });
 
   chrome.runtime.onMessage.addListener((message: any, sender, sendResponse) => {
-    if (!message || typeof message.type !== 'string' || !message.type.startsWith('code-review:')) {
-      return false;
-    }
+    if (!message || typeof message.type !== 'string' || !message.type.startsWith('code-review:')) return false;
 
     const run = async () => {
       switch (message.type) {
         case CODE_REVIEW_CONTROL_MESSAGES.STATUS: {
-          const [session, pendingRequest] = await Promise.all([
+          const [session, pendingRequests] = await Promise.all([
             getActiveCodeReviewSession(),
-            getPendingCodeReviewRequest(),
+            getPendingCodeReviewRequests(),
           ]);
-          return { success: true, session, pendingRequest };
+          return {
+            success: true,
+            session,
+            pendingRequests,
+            pendingRequest: pendingRequests[0] || null,
+          };
         }
 
-        // Kept for backwards compatibility. New requests normally arrive through
-        // the local MCP tool request_code_review_access, not from the UI.
         case CODE_REVIEW_CONTROL_MESSAGES.REQUEST: {
           const { owner, repo, durationMinutes } = readRequestPayload(message);
           const tabId = sender.tab?.id;
+          if (tabId === undefined) throw new Error('درخواست دسترسی فقط از داخل تب مرورگر مجاز است.');
 
-          if (tabId === undefined) {
-            throw new Error('درخواست دسترسی فقط از داخل تب مرورگر مجاز است.');
-          }
-
-          const request = await createPendingCodeReviewRequest({ owner, repo, durationMinutes });
-          const sent = await notifyCodeReviewAccessRequested(owner, repo, durationMinutes);
-          await auditNotificationResult({
-            sent,
+          const sourcePath = safeSourcePath(sender.tab?.url);
+          const request = await createPendingCodeReviewRequest({
             owner,
             repo,
-            tabId,
-            reason: 'access_requested',
+            durationMinutes,
+            sourceTabId: tabId,
+            sourcePath,
+            sourceKey: sourcePath ? `${tabId}:${sourcePath}:${owner}/${repo}:${durationMinutes}` : undefined,
           });
 
+          const sent = await notifyCodeReviewAccessRequested(owner, repo, durationMinutes);
+          await auditNotificationResult({ sent, owner, repo, tabId, reason: 'access_requested' });
           return { success: true, pendingRequest: request };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.APPROVE: {
-          const approvedTabId = sender.tab?.id;
-          if (approvedTabId === undefined) {
-            throw new Error('تأیید دسترسی فقط از داخل تب مرورگر مجاز است.');
-          }
+          const requestId = readRequestId(message);
+          const approvingTabId = sender.tab?.id;
+          if (approvingTabId === undefined) throw new Error('تأیید دسترسی فقط از داخل تب مرورگر مجاز است.');
 
-          const pending = await getPendingCodeReviewRequest();
-          if (!pending) {
-            throw new Error('هیچ درخواست دسترسی منتظر تأییدی وجود ندارد.');
-          }
+          const pendingRequests = await getPendingCodeReviewRequests();
+          const pending = pendingRequests.find(request => request.id === requestId);
+          if (!pending) throw new Error('این درخواست دیگر در صف انتظار وجود ندارد.');
 
-          // Approval is intentionally bound to the exact request previously
-          // created by the AI-facing local MCP tool. The UI cannot substitute a
-          // different repository or duration at approval time.
           const session = await startCodeReviewSession({
             owner: pending.owner,
             repo: pending.repo,
             durationMinutes: pending.durationMinutes,
-            approvedTabId,
+            approvedTabId: approvingTabId,
+            requestId: pending.id,
           });
 
           await scheduleCodeReviewExpiryNotification({
@@ -159,30 +168,31 @@ export function registerCodeReviewControlBridge(): void {
             sessionId: session.id,
             owner: session.owner,
             repo: session.repo,
-            tabId: approvedTabId,
+            tabId: session.approvedTabId,
             reason: 'session_started',
           });
 
-          return { success: true, session, pendingRequest: null };
+          const remaining = await getPendingCodeReviewRequests();
+          return { success: true, session, pendingRequests: remaining, pendingRequest: remaining[0] || null };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REJECT: {
-          if (sender.tab?.id === undefined) {
-            throw new Error('رد درخواست فقط از داخل تب مرورگر مجاز است.');
-          }
-          const rejected = await rejectPendingCodeReviewRequest('explicitly rejected by user');
-          return { success: true, pendingRequest: null, rejected };
+          if (sender.tab?.id === undefined) throw new Error('رد درخواست فقط از داخل تب مرورگر مجاز است.');
+          const requestId = readRequestId(message);
+          const rejected = await rejectPendingCodeReviewRequest('explicitly rejected by user', requestId);
+          if (!rejected) throw new Error('این درخواست دیگر در صف انتظار وجود ندارد.');
+          const remaining = await getPendingCodeReviewRequests();
+          return { success: true, pendingRequests: remaining, pendingRequest: remaining[0] || null, rejected };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REVOKE: {
           const active = await getActiveCodeReviewSession();
           if (active && sender.tab?.id !== undefined && active.approvedTabId !== sender.tab.id) {
-            throw new Error('لغو این نشست فقط از همان تبی که آن را تأیید کرده مجاز است.');
+            throw new Error('لغو این نشست فقط از همان تبی که نشست برای آن فعال شده مجاز است.');
           }
 
           const revoked = await revokeCodeReviewSession('manual revoke from Persian Code Review UI');
           await clearCodeReviewExpiryNotification();
-
           const sent = await notifyCodeReviewRevoked(revoked?.owner, revoked?.repo);
           await auditNotificationResult({
             sent,
@@ -193,7 +203,8 @@ export function registerCodeReviewControlBridge(): void {
             reason: 'session_revoked',
           });
 
-          return { success: true, session: null };
+          const pendingRequests = await getPendingCodeReviewRequests();
+          return { success: true, session: null, pendingRequests, pendingRequest: pendingRequests[0] || null };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.AUDIT: {
