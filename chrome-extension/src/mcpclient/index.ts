@@ -23,7 +23,10 @@ import {
   recordCodeReviewAuditEvent,
 } from '../security/codeReviewGate.js';
 import { notifyCodeReviewAccessRequested } from '../security/codeReviewNotifications.js';
-import { registerCodeReviewControlBridge } from '../security/codeReviewControlBridge.js';
+import {
+  consumeCodeReviewCallerContext,
+  registerCodeReviewControlBridge,
+} from '../security/codeReviewControlBridge.js';
 
 registerCodeReviewControlBridge();
 
@@ -133,18 +136,27 @@ async function executeGatedToolCall(
   callerTabId?: number,
   callerSourceUrl?: string,
 ): Promise<any> {
+  // The legacy background handler does not yet pass sender.tab through its
+  // function signature. The control bridge captures that trusted sender context
+  // before the legacy listener runs and we consume it here. Explicit arguments,
+  // when supplied by newer callers, always take precedence.
+  const capturedContext =
+    callerTabId === undefined ? consumeCodeReviewCallerContext(toolName, args || {}) : null;
+  const effectiveCallerTabId = callerTabId ?? capturedContext?.tabId;
+  const effectiveSourceUrl = callerSourceUrl ?? capturedContext?.sourceUrl;
+
   if (toolName === CODE_REVIEW_REQUEST_TOOL_NAME) {
     const pendingBefore = await getPendingCodeReviewRequests();
-    const sourcePath = safeSourcePath(callerSourceUrl);
+    const sourcePath = safeSourcePath(effectiveSourceUrl);
     const request = await createPendingCodeReviewRequest({
-      sourceTabId: callerTabId,
+      sourceTabId: effectiveCallerTabId,
       sourcePath,
       sourceKey:
-        callerTabId === undefined
+        effectiveCallerTabId === undefined
           ? undefined
           : sourcePath
-            ? `${callerTabId}:${sourcePath}`
-            : `tab:${callerTabId}`,
+            ? `${effectiveCallerTabId}:${sourcePath}`
+            : `tab:${effectiveCallerTabId}`,
     });
 
     const wasAlreadyPending = pendingBefore.some(item => item.id === request.id);
@@ -159,7 +171,7 @@ async function executeGatedToolCall(
         action: sent ? 'notification_sent' : 'notification_failed',
         owner: request.owner,
         repo: request.repo,
-        tabId: callerTabId,
+        tabId: effectiveCallerTabId,
         reason: 'AI requested Code Review approval',
       });
     }
@@ -179,10 +191,14 @@ async function executeGatedToolCall(
     };
   }
 
-  // Read operations are authorized against the real content-script sender tab.
-  // No compatibility fallback is used: if callerTabId is absent or different
-  // from the tab bound to the approved session, the gate denies the call.
-  const sanitizedArgs = await authorizeCodeReviewToolCall(toolName, args || {}, callerTabId);
+  // There is deliberately no "use the approved tab as the caller" fallback.
+  // A real tab id must be supplied directly or recovered from the trusted
+  // runtime-message capture above, otherwise the gate denies the operation.
+  const sanitizedArgs = await authorizeCodeReviewToolCall(
+    toolName,
+    args || {},
+    effectiveCallerTabId,
+  );
   const result = await client.callTool(toolName, sanitizedArgs, adapterName);
   return await enforceCodeReviewResultPolicy(toolName, result);
 }
@@ -198,9 +214,11 @@ async function getGatedPrimitives(
     return [{ type: 'tool', value: await getCodeReviewRequestTool() }];
   }
 
-  // An active Code Review session is intentionally visible in the security UI
-  // everywhere, but its GitHub tools are exposed only to the originating tab.
-  if (callerTabId === undefined || callerTabId !== session.approvedTabId) {
+  // New callers can request a tab-scoped list. Legacy background broadcasts do
+  // not carry a tab id yet, so they receive the allowlisted read set; the
+  // content-side security synchronizer hides that set from every non-origin tab.
+  // Execution itself remains strictly tab-gated above.
+  if (callerTabId !== undefined && callerTabId !== session.approvedTabId) {
     return [];
   }
 
@@ -281,7 +299,7 @@ export async function runWithBackwardsCompatibility(
   await client.connect({ uri, type });
   const primitives = await getGatedPrimitives(client, false);
   const toolCount = primitives.filter(p => p.type === 'tool').length;
-  logger.debug(`Connected, ${toolCount} globally broadcastable Code Review tools currently exposed`);
+  logger.debug(`Connected, ${toolCount} Code Review tools currently exposed`);
 }
 
 export function resetMcpConnectionState(): void {
