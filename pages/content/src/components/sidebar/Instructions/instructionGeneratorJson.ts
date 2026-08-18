@@ -88,6 +88,7 @@ Rules:
 8. Do not put function-call JSONL in reasoning/thoughts. Put it only in the final response when invoking a tool.
 9. If the only exposed tool is an access-request tool, use it first when the user's task requires repository access. Do not claim repository access until approval has actually been granted.
 10. If an access request is pending, tell the user only that approval is required and wait; do not emit repository-read calls until the tool list changes after approval.
+11. If a listed tool says \`Parameters: none\`, emit NO \`parameter\` lines for that call. Output only the function start, optional description, and function end lines.
 
 ## Required function-call format
 Output a fenced \`jsonl\` block containing one valid JSON object per line.
@@ -101,7 +102,7 @@ The template below is intentionally NOT valid JSON so MCP SuperAssistant will ne
 {"type":"function_call_end","call_id":1}
 \`\`\`
 
-For a real call, \`FUNCTION_NAME_JSON_STRING\` must become a quoted JSON string such as \`"request_code_review_access"\`. \`PARAMETER_NAME_JSON_STRING\` must become a quoted parameter name, and \`PARAMETER_VALUE_JSON\` must become the actual JSON value. Use one \`parameter\` line for each parameter. Preserve JSON types in \`value\`: strings as strings, numbers as numbers, booleans as booleans, and arrays/objects as valid JSON values. Increment \`call_id\` for each later tool call in the conversation.
+For a real call, \`FUNCTION_NAME_JSON_STRING\` must become a quoted JSON string such as \`"request_code_review_access"\`. \`PARAMETER_NAME_JSON_STRING\` must become a quoted parameter name, and \`PARAMETER_VALUE_JSON\` must become the actual JSON value. Use one \`parameter\` line for each listed parameter, and use zero \`parameter\` lines when the tool has \`Parameters: none\`. Preserve JSON types in \`value\`: strings as strings, numbers as numbers, booleans as booleans, and arrays/objects as valid JSON values. Increment \`call_id\` for each later tool call in the conversation.
 
 ## Available MCP tools
 
