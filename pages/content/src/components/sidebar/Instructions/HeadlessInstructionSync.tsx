@@ -15,6 +15,20 @@ interface ParsedReviewRequest {
   durationMinutes: 5 | 10 | 20;
 }
 
+interface ReviewStatusResponse {
+  success?: boolean;
+  session?: {
+    owner?: string;
+    repo?: string;
+    durationMinutes?: number;
+  } | null;
+  pendingRequest?: {
+    owner?: string;
+    repo?: string;
+    durationMinutes?: number;
+  } | null;
+}
+
 function parseJsonObjects(text: string): any[] {
   const objects: any[] = [];
   const matches = text.match(/\{[^{}]*\}/gs) || [];
@@ -78,8 +92,78 @@ async function dispatchReviewRequest(request: ParsedReviewRequest): Promise<void
     throw new Error(response?.error || 'Background rejected the Code Review approval request');
   }
 
-  // Wake the Persian approval UI immediately instead of waiting for its status poll.
   window.dispatchEvent(new CustomEvent('code-review:pending-updated'));
+}
+
+function requestMatches(
+  candidate: { owner?: string; repo?: string; durationMinutes?: number } | null | undefined,
+  request: ParsedReviewRequest,
+): boolean {
+  return Boolean(
+    candidate &&
+      candidate.owner?.toLowerCase() === request.owner.toLowerCase() &&
+      candidate.repo?.toLowerCase() === request.repo.toLowerCase() &&
+      Number(candidate.durationMinutes) === request.durationMinutes,
+  );
+}
+
+function findRenderedReviewBlocks(request: ParsedReviewRequest): HTMLElement[] {
+  return Array.from(document.querySelectorAll<HTMLElement>('.function-block')).filter(block => {
+    const text = block.textContent || '';
+    return (
+      text.includes(REVIEW_REQUEST_TOOL) &&
+      text.toLowerCase().includes(request.owner.toLowerCase()) &&
+      text.toLowerCase().includes(request.repo.toLowerCase())
+    );
+  });
+}
+
+function setRenderedReviewState(
+  request: ParsedReviewRequest,
+  state: 'pending' | 'approved',
+): void {
+  const blocks = findRenderedReviewBlocks(request);
+
+  for (const block of blocks) {
+    block.setAttribute('data-review-approval-state', state);
+
+    let status = block.querySelector<HTMLElement>('[data-review-status]');
+    if (!status) {
+      status = document.createElement('div');
+      status.setAttribute('data-review-status', 'true');
+      status.style.marginTop = '12px';
+      status.style.padding = '10px 12px';
+      status.style.borderRadius = '8px';
+      status.style.fontSize = '13px';
+      status.style.fontWeight = '600';
+      status.style.lineHeight = '1.5';
+      block.appendChild(status);
+    }
+
+    if (state === 'pending') {
+      status.textContent = `در انتظار تأیید شما برای ${request.owner}/${request.repo}`;
+      status.style.background = 'rgba(245, 158, 11, 0.14)';
+      status.style.border = '1px solid rgba(245, 158, 11, 0.45)';
+      status.style.color = 'inherit';
+    } else {
+      status.textContent = `✓ دسترسی ${request.owner}/${request.repo} تأیید و فعال شد`;
+      status.style.background = 'rgba(16, 185, 129, 0.14)';
+      status.style.border = '1px solid rgba(16, 185, 129, 0.45)';
+      status.style.color = 'inherit';
+
+      // A second execution of the access-request tool would only create a new
+      // pending request, so disable the generic Run/Re-execute controls after
+      // approval. GitHub reads continue through the newly exposed read tools.
+      block.querySelectorAll<HTMLButtonElement>('button').forEach(button => {
+        const label = (button.textContent || '').trim().toLowerCase();
+        if (label === 'run' || label === 're-execute' || label.includes('re-execute')) {
+          button.disabled = true;
+          button.style.opacity = '0.45';
+          button.style.cursor = 'not-allowed';
+        }
+      });
+    }
+  }
 }
 
 /**
@@ -98,6 +182,7 @@ export function HeadlessInstructionSync() {
   const refreshedForConnection = useRef(false);
   const processedSources = useRef<WeakSet<HTMLElement>>(new WeakSet());
   const inFlightKeys = useRef<Set<string>>(new Set());
+  const knownRequests = useRef<Map<string, ParsedReviewRequest>>(new Map());
 
   useEffect(() => {
     if (!isInitialized || !isConnected || refreshedForConnection.current) return;
@@ -132,6 +217,7 @@ export function HeadlessInstructionSync() {
       if (!request) return;
 
       const requestKey = `${request.owner.toLowerCase()}/${request.repo.toLowerCase()}:${request.durationMinutes}`;
+      knownRequests.current.set(requestKey, request);
       if (inFlightKeys.current.has(requestKey)) return;
 
       processedSources.current.add(source);
@@ -143,6 +229,13 @@ export function HeadlessInstructionSync() {
         );
         await dispatchReviewRequest(request);
         source.setAttribute('data-review-request-dispatched', 'true');
+
+        // Rendering of the generic function card can finish a few ticks after
+        // the raw <pre> has been parsed, so update both immediately and shortly
+        // afterwards.
+        setRenderedReviewState(request, 'pending');
+        window.setTimeout(() => setRenderedReviewState(request, 'pending'), 100);
+        window.setTimeout(() => setRenderedReviewState(request, 'pending'), 500);
       } catch (error) {
         processedSources.current.delete(source);
         logger.warn(
@@ -161,6 +254,31 @@ export function HeadlessInstructionSync() {
       });
     };
 
+    const syncApprovalState = async () => {
+      if (disposed || knownRequests.current.size === 0) return;
+
+      try {
+        const response = (await chrome.runtime.sendMessage({
+          type: 'code-review:get-status',
+        })) as ReviewStatusResponse;
+
+        if (!response?.success) return;
+
+        for (const request of knownRequests.current.values()) {
+          if (requestMatches(response.session, request)) {
+            setRenderedReviewState(request, 'approved');
+          } else if (requestMatches(response.pendingRequest, request)) {
+            setRenderedReviewState(request, 'pending');
+          }
+        }
+      } catch (error) {
+        logger.debug(
+          '[HeadlessInstructionSync] Approval-state sync skipped:',
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    };
+
     const scheduleScan = () => {
       if (scanScheduled || disposed) return;
       scanScheduled = true;
@@ -171,6 +289,8 @@ export function HeadlessInstructionSync() {
     };
 
     scan();
+    void syncApprovalState();
+
     const observer = new MutationObserver(scheduleScan);
     observer.observe(document.body, {
       childList: true,
@@ -178,9 +298,12 @@ export function HeadlessInstructionSync() {
       characterData: true,
     });
 
+    const approvalPoll = window.setInterval(() => void syncApprovalState(), 500);
+
     return () => {
       disposed = true;
       observer.disconnect();
+      window.clearInterval(approvalPoll);
     };
   }, [isConnected, isInitialized]);
 
