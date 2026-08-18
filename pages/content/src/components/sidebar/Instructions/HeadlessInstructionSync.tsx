@@ -12,6 +12,7 @@ const REVIEW_REQUEST_TOOL = 'request_code_review_access';
 const ALLOWED_DURATIONS = new Set([5, 10, 20]);
 
 interface ParsedReviewRequest {
+  id?: string;
   owner: string;
   repo: string;
   durationMinutes: 5 | 10 | 20;
@@ -66,58 +67,44 @@ function parseJsonObjects(text: string): any[] {
       const parsed = JSON.parse(candidate);
       if (parsed && typeof parsed === 'object') objects.push(parsed);
     } catch {
-      // Streaming may leave a partial object in the DOM. Ignore it until the
-      // next mutation completes the JSON object.
+      // Ignore partial streaming JSON until the next DOM mutation completes it.
     }
   }
 
   return objects;
 }
 
-function parseReviewRequest(text: string): ParsedReviewRequest | null {
-  if (!text || !/"name"\s*:\s*"request_code_review_access"/.test(text)) return null;
-
+function containsReviewRequestCall(text: string): boolean {
+  if (!text || !/"name"\s*:\s*"request_code_review_access"/.test(text)) return false;
   const objects = parseJsonObjects(text);
-  const start = objects.find(item => item?.type === 'function_call_start' && item?.name === REVIEW_REQUEST_TOOL);
-  if (!start) return null;
-
-  const parameters = new Map<string, unknown>();
-  for (const item of objects) {
-    if (item?.type === 'parameter' && typeof item?.key === 'string') {
-      parameters.set(item.key, item.value);
-    }
-  }
-
-  const ownerValue = parameters.get('owner');
-  const repoValue = parameters.get('repo');
-  const durationValue = Number(parameters.get('durationMinutes'));
-  const owner = typeof ownerValue === 'string' ? ownerValue.trim() : '';
-  const repo = typeof repoValue === 'string' ? repoValue.trim() : '';
-
-  if (!owner || !repo || !ALLOWED_DURATIONS.has(durationValue)) return null;
-
-  return {
-    owner,
-    repo,
-    durationMinutes: durationValue as 5 | 10 | 20,
-  };
+  return objects.some(item => item?.type === 'function_call_start' && item?.name === REVIEW_REQUEST_TOOL);
 }
 
-async function dispatchReviewRequest(request: ParsedReviewRequest): Promise<void> {
-  // Route approval requests through the code-review control bridge instead of
-  // the generic tool execution path. The bridge sees sender.tab and sender.tab.url,
-  // so the global queue can retain the originating tab/conversation while still
-  // being manageable from every other chat.
-  const response = await chrome.runtime.sendMessage({
-    type: 'code-review:request',
-    payload: request,
-  });
+async function dispatchReviewRequest(): Promise<ParsedReviewRequest> {
+  // Repository and duration are deliberately NOT supplied by the model. The
+  // background security gate resolves them from the user's persisted settings.
+  const response = await chrome.runtime.sendMessage({ type: 'code-review:request' });
 
   if (!response?.success) {
     throw new Error(response?.error || 'Background rejected the Code Review approval request');
   }
 
+  const pending = response.pendingRequest as PendingReviewRequest | undefined;
+  const owner = typeof pending?.owner === 'string' ? pending.owner.trim() : '';
+  const repo = typeof pending?.repo === 'string' ? pending.repo.trim() : '';
+  const durationMinutes = Number(pending?.durationMinutes);
+
+  if (!owner || !repo || !ALLOWED_DURATIONS.has(durationMinutes)) {
+    throw new Error('Background returned an invalid configured Code Review request');
+  }
+
   window.dispatchEvent(new CustomEvent('code-review:pending-updated'));
+  return {
+    id: pending?.id,
+    owner,
+    repo,
+    durationMinutes: durationMinutes as 5 | 10 | 20,
+  };
 }
 
 function requestMatches(
@@ -133,20 +120,19 @@ function requestMatches(
 }
 
 function findRenderedReviewBlocks(request: ParsedReviewRequest): HTMLElement[] {
-  return Array.from(document.querySelectorAll<HTMLElement>('.function-block')).filter(block => {
-    const text = block.textContent || '';
-    return (
-      text.includes(REVIEW_REQUEST_TOOL) &&
-      text.toLowerCase().includes(request.owner.toLowerCase()) &&
-      text.toLowerCase().includes(request.repo.toLowerCase())
-    );
+  const all = Array.from(document.querySelectorAll<HTMLElement>('.function-block')).filter(block =>
+    (block.textContent || '').includes(REVIEW_REQUEST_TOOL),
+  );
+
+  const exact = all.filter(block => {
+    const text = (block.textContent || '').toLowerCase();
+    return text.includes(request.owner.toLowerCase()) && text.includes(request.repo.toLowerCase());
   });
+
+  return exact.length > 0 ? exact : all.slice(-1);
 }
 
-function setRenderedReviewState(
-  request: ParsedReviewRequest,
-  state: 'pending' | 'approved',
-): void {
+function setRenderedReviewState(request: ParsedReviewRequest, state: 'pending' | 'approved'): void {
   const blocks = findRenderedReviewBlocks(request);
 
   for (const block of blocks) {
@@ -166,7 +152,7 @@ function setRenderedReviewState(
     }
 
     if (state === 'pending') {
-      status.textContent = `در انتظار تأیید شما برای ${request.owner}/${request.repo}`;
+      status.textContent = `در انتظار تأیید شما برای ${request.owner}/${request.repo} — ${request.durationMinutes} دقیقه`;
       status.style.background = 'rgba(245, 158, 11, 0.14)';
       status.style.border = '1px solid rgba(245, 158, 11, 0.45)';
       status.style.color = 'inherit';
@@ -212,7 +198,6 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
         variant: 'success',
       });
       break;
-
     case 'session_revoked':
       emitSecurityToast({
         id: `session-revoked:${entry.timestamp || Date.now()}`,
@@ -221,7 +206,6 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
         variant: 'info',
       });
       break;
-
     case 'session_expired':
       emitSecurityToast({
         id: `session-expired:${entry.timestamp || Date.now()}`,
@@ -230,7 +214,6 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
         variant: 'warning',
       });
       break;
-
     case 'access_rejected':
       emitSecurityToast({
         id: `access-rejected:${entry.timestamp || Date.now()}`,
@@ -239,7 +222,6 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
         variant: 'warning',
       });
       break;
-
     case 'tool_denied':
     case 'response_denied':
       emitSecurityToast({
@@ -250,7 +232,6 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
         durationMs: 6500,
       });
       break;
-
     case 'notification_failed':
       emitSecurityToast({
         id: `notification-failed:${entry.timestamp || Date.now()}`,
@@ -259,28 +240,18 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
         variant: 'warning',
       });
       break;
-
     default:
       break;
   }
 }
 
-/**
- * Keeps MCP instructions generated and synchronized without rendering the old
- * sidebar Instructions UI. It recognizes the safe local approval tool directly
- * from raw ChatGPT output, creates a globally visible pending request bound to
- * its originating chat, and owns the global security toaster.
- *
- * Important: this does NOT grant GitHub access. GitHub read tools remain
- * unavailable until the user explicitly approves a specific queued request.
- */
 export function HeadlessInstructionSync() {
   const { tools } = useAvailableTools();
   const { preferences } = useUserPreferences();
   const { isInitialized, isConnected, refreshTools } = useMcpCommunication();
   const refreshedForConnection = useRef(false);
   const processedSources = useRef<WeakSet<HTMLElement>>(new WeakSet());
-  const inFlightKeys = useRef<Set<string>>(new Set());
+  const inFlightPaths = useRef<Set<string>>(new Set());
   const knownRequests = useRef<Map<string, ParsedReviewRequest>>(new Map());
   const seenAuditEntries = useRef<Set<string>>(new Set());
   const auditSeeded = useRef(false);
@@ -312,24 +283,21 @@ export function HeadlessInstructionSync() {
       if (processedSources.current.has(source)) return;
       if (source.getAttribute('data-review-request-dispatched') === 'true') return;
       if (source.closest('.function-block')) return;
-
-      const request = parseReviewRequest(source.textContent || '');
-      if (!request) return;
+      if (!containsReviewRequestCall(source.textContent || '')) return;
 
       const path = currentConversationPath();
-      const requestKey = `${path}:${request.owner.toLowerCase()}/${request.repo.toLowerCase()}:${request.durationMinutes}`;
-      knownRequests.current.set(requestKey, request);
-      if (inFlightKeys.current.has(requestKey)) return;
+      if (inFlightPaths.current.has(path)) return;
 
       processedSources.current.add(source);
-      inFlightKeys.current.add(requestKey);
+      inFlightPaths.current.add(path);
 
       try {
-        logger.debug(
-          `[HeadlessInstructionSync] Queueing approval request for ${request.owner}/${request.repo} (${request.durationMinutes}m) from ${path}`,
-        );
-        await dispatchReviewRequest(request);
+        logger.debug(`[HeadlessInstructionSync] Queueing configured approval request from ${path}`);
+        const request = await dispatchReviewRequest();
         source.setAttribute('data-review-request-dispatched', 'true');
+
+        const requestKey = request.id || `${path}:${request.owner.toLowerCase()}/${request.repo.toLowerCase()}:${request.durationMinutes}`;
+        knownRequests.current.set(requestKey, request);
 
         emitSecurityToast({
           id: `access-request:${requestKey}`,
@@ -346,33 +314,28 @@ export function HeadlessInstructionSync() {
         const message = error instanceof Error ? error.message : String(error);
         logger.warn('[HeadlessInstructionSync] Local approval request dispatch failed:', message);
         emitSecurityToast({
-          id: `access-request-error:${requestKey}`,
+          id: `access-request-error:${path}`,
           title: 'ثبت درخواست دسترسی ناموفق بود',
           message,
           variant: 'error',
           durationMs: 6500,
         });
       } finally {
-        inFlightKeys.current.delete(requestKey);
+        inFlightPaths.current.delete(path);
       }
     };
 
     const scan = () => {
       if (disposed) return;
-      document.querySelectorAll<HTMLElement>('pre').forEach(source => {
-        void processSource(source);
-      });
+      document.querySelectorAll<HTMLElement>('pre').forEach(source => void processSource(source));
     };
 
     const syncApprovalState = async () => {
       if (disposed) return;
-
       try {
-        const response = (await chrome.runtime.sendMessage({
-          type: 'code-review:get-status',
-        })) as ReviewStatusResponse;
-
+        const response = (await chrome.runtime.sendMessage({ type: 'code-review:get-status' })) as ReviewStatusResponse;
         if (!response?.success) return;
+
         const pendingRequests = Array.isArray(response.pendingRequests)
           ? response.pendingRequests
           : response.pendingRequest
@@ -396,12 +359,8 @@ export function HeadlessInstructionSync() {
 
     const syncSecurityToasts = async () => {
       if (disposed) return;
-
       try {
-        const response = (await chrome.runtime.sendMessage({
-          type: 'code-review:get-audit',
-        })) as ReviewAuditResponse;
-
+        const response = (await chrome.runtime.sendMessage({ type: 'code-review:get-audit' })) as ReviewAuditResponse;
         if (!response?.success || !Array.isArray(response.entries)) return;
 
         if (!auditSeeded.current) {
@@ -442,11 +401,7 @@ export function HeadlessInstructionSync() {
     void syncSecurityToasts();
 
     const observer = new MutationObserver(scheduleScan);
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 
     const approvalPoll = window.setInterval(() => void syncApprovalState(), 500);
     const auditPoll = window.setInterval(() => void syncSecurityToasts(), 1000);
@@ -484,9 +439,7 @@ export function HeadlessInstructionSync() {
 
   useEffect(() => {
     instructionsState.setInstructions(generatedInstructions);
-    logger.debug(
-      `[HeadlessInstructionSync] Synced instructions for ${instructionTools.length} exposed MCP tool(s)`,
-    );
+    logger.debug(`[HeadlessInstructionSync] Synced instructions for ${instructionTools.length} exposed MCP tool(s)`);
   }, [generatedInstructions, instructionTools.length]);
 
   return <SecurityToastContainer />;
