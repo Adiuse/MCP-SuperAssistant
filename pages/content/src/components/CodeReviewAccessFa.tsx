@@ -1,7 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { useCurrentAdapter } from '../hooks';
 import { useMcpCommunication } from '../hooks/useMcpCommunication';
-import { instructionsState } from './sidebar/Instructions/InstructionManager';
 import { emitSecurityToast } from './mcpPopover/securityToast';
 
 type DurationMinutes = 5 | 10 | 20;
@@ -39,6 +37,7 @@ interface PendingCodeReviewRequest {
 
 interface ControlResponse {
   success: boolean;
+  currentTabId?: number;
   session?: CodeReviewSession | null;
   settings?: CodeReviewPreferences | null;
   pendingRequests?: PendingCodeReviewRequest[];
@@ -50,30 +49,9 @@ interface ControlResponse {
 const DURATIONS: DurationMinutes[] = [5, 10, 20];
 const OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const REPO_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
-const READ_TOOL_PATTERN = /###\s+(get_file_contents|search_code|get_repository_tree|list_commits|get_commit|get_file_blame|list_branches|list_tags|get_tag|list_pull_requests|pull_request_read)\b/;
 
 async function sendControlMessage<T = ControlResponse>(message: Record<string, unknown>): Promise<T> {
   return (await chrome.runtime.sendMessage(message)) as T;
-}
-
-async function refreshMcpTools(): Promise<void> {
-  const response = await chrome.runtime.sendMessage({ type: 'mcp:force-reconnect', payload: {} });
-  if (response?.success === false) {
-    throw new Error(response.error || 'بازاتصال MCP ناموفق بود.');
-  }
-}
-
-async function waitForRefreshedInstructions(timeoutMs = 6000): Promise<string> {
-  const startedAt = Date.now();
-  let latest = instructionsState.instructions || '';
-
-  while (Date.now() - startedAt < timeoutMs) {
-    latest = instructionsState.instructions || latest;
-    if (READ_TOOL_PATTERN.test(latest)) return latest;
-    await new Promise(resolve => window.setTimeout(resolve, 100));
-  }
-
-  return latest;
 }
 
 function currentConversationPath(): string {
@@ -102,7 +80,6 @@ function sourceLabel(request: PendingCodeReviewRequest): string {
 }
 
 export function CodeReviewAccessFa() {
-  const { insertText, submitForm, isReady: isAdapterReady } = useCurrentAdapter();
   const { refreshTools } = useMcpCommunication();
   const [owner, setOwner] = useState('');
   const [repo, setRepo] = useState('');
@@ -161,14 +138,6 @@ export function CodeReviewAccessFa() {
     };
   }, []);
 
-  useEffect(() => {
-    if (session && now >= session.expiresAt) {
-      setSession(null);
-      void loadStatus(false);
-      void refreshMcpTools().catch(() => {});
-    }
-  }, [now, session]);
-
   const remainingSeconds = useMemo(() => {
     if (!session) return 0;
     return Math.max(0, Math.ceil((session.expiresAt - now) / 1000));
@@ -178,6 +147,11 @@ export function CodeReviewAccessFa() {
     const min = Math.floor(seconds / 60);
     const sec = seconds % 60;
     return `${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+  };
+
+  const markSettingsDirty = () => {
+    setSettingsDirty(true);
+    setSettingsSaved(false);
   };
 
   const validateRepository = (): boolean => {
@@ -203,6 +177,7 @@ export function CodeReviewAccessFa() {
 
   const saveSettings = async () => {
     if (!validateRepository()) return;
+
     setLoading(true);
     setError('');
     try {
@@ -224,6 +199,7 @@ export function CodeReviewAccessFa() {
       setSettingsDirty(false);
       setSettingsSaved(true);
       await refreshTools(true).catch(() => []);
+
       emitSecurityToast({
         title: 'تنظیمات Code Review ذخیره شد',
         message: `${response.settings.owner}/${response.settings.repo} — ${response.settings.durationMinutes} دقیقه`,
@@ -261,49 +237,6 @@ export function CodeReviewAccessFa() {
     }
   };
 
-  const resumeApprovedReview = async (approvedSession: CodeReviewSession) => {
-    try {
-      await refreshMcpTools();
-      const refreshedTools = await refreshTools(true);
-      const hasReadTools = refreshedTools.some(tool =>
-        ['get_file_contents', 'search_code', 'get_repository_tree', 'list_commits'].includes(tool.name),
-      );
-
-      if (!hasReadTools) {
-        throw new Error('نشست تأیید شد اما ابزارهای Read-only GitHub از MCP دریافت نشدند.');
-      }
-
-      const updatedInstructions = await waitForRefreshedInstructions();
-      if (!READ_TOOL_PATTERN.test(updatedInstructions)) {
-        throw new Error('ابزارهای GitHub دریافت شدند اما Instructions مدل هنوز با ابزارهای جدید همگام نشده است.');
-      }
-
-      if (!isAdapterReady) {
-        throw new Error('آداپتر چت برای ادامه خودکار آماده نیست.');
-      }
-
-      const continuation = `${updatedInstructions}\n\n[MCP Approval Result] Code Review access is approved and active for ${approvedSession.owner}/${approvedSession.repo} for ${approvedSession.durationMinutes} minutes. Continue the pending repository task now with the exposed read-only MCP tools. Do not request access again unless this session expires or is revoked.`;
-      const inserted = await insertText(continuation);
-      if (!inserted) throw new Error('درج پیام ادامه در چت ناموفق بود.');
-
-      const submitted = await submitForm();
-      if (!submitted) throw new Error('ارسال خودکار پیام ادامه ناموفق بود.');
-
-      emitSecurityToast({
-        title: 'بررسی کد ادامه پیدا کرد',
-        message: `${approvedSession.owner}/${approvedSession.repo} — ابزارهای Read-only به مدل اعلام شدند.`,
-        variant: 'success',
-      });
-    } catch (resumeError) {
-      emitSecurityToast({
-        title: 'ادامه خودکار Code Review ناموفق بود',
-        message: resumeError instanceof Error ? resumeError.message : String(resumeError),
-        variant: 'warning',
-        durationMs: 6500,
-      });
-    }
-  };
-
   const approvePending = async (request: PendingCodeReviewRequest) => {
     if (session) {
       setError('یک نشست Code Review فعال است. برای فعال‌سازی درخواست دیگری ابتدا نشست فعال را لغو کنید.');
@@ -322,18 +255,19 @@ export function CodeReviewAccessFa() {
       }
 
       applyStatusResponse(response);
+      await refreshTools(true).catch(() => []);
+      window.dispatchEvent(new CustomEvent('code-review:pending-updated'));
+
       const isOriginConversation = !request.sourcePath || request.sourcePath === currentConversationPath();
-      if (isOriginConversation) {
-        await resumeApprovedReview(response.session);
-      } else {
-        emitSecurityToast({
-          id: `approved-remote:${request.id}`,
-          title: 'درخواست سشن دیگر تأیید شد',
-          message: `${request.owner}/${request.repo} برای مبدأ ${sourceLabel(request)} فعال شد.`,
-          variant: 'success',
-          durationMs: 6500,
-        });
-      }
+      emitSecurityToast({
+        id: `approved:${request.id}`,
+        title: 'دسترسی Code Review فعال شد',
+        message: isOriginConversation
+          ? `${request.owner}/${request.repo} فعال شد؛ ادامه کار در همین گفت‌وگو به‌صورت خودکار انجام می‌شود.`
+          : `${request.owner}/${request.repo} فعال شد؛ گفت‌وگوی مبدأ به‌صورت خودکار ادامه می‌دهد.`,
+        variant: 'success',
+        durationMs: 6500,
+      });
     } catch (approvalError) {
       setError(approvalError instanceof Error ? approvalError.message : 'فعال‌سازی دسترسی ناموفق بود.');
     } finally {
@@ -348,8 +282,8 @@ export function CodeReviewAccessFa() {
       const response = await sendControlMessage<ControlResponse>({ type: 'code-review:revoke' });
       if (!response.success) throw new Error(response.error || 'لغو دسترسی ناموفق بود.');
       applyStatusResponse(response);
-      await refreshMcpTools();
       await refreshTools(true).catch(() => []);
+      window.dispatchEvent(new CustomEvent('code-review:pending-updated'));
     } catch (revokeError) {
       setError(revokeError instanceof Error ? revokeError.message : 'لغو دسترسی ناموفق بود.');
     } finally {
@@ -360,11 +294,6 @@ export function CodeReviewAccessFa() {
   const openSourceConversation = (request: PendingCodeReviewRequest) => {
     if (!request.sourcePath) return;
     window.open(`${window.location.origin}${request.sourcePath}`, '_blank', 'noopener,noreferrer');
-  };
-
-  const markSettingsDirty = () => {
-    setSettingsDirty(true);
-    setSettingsSaved(false);
   };
 
   const statusLabel = session
@@ -381,7 +310,7 @@ export function CodeReviewAccessFa() {
         <div>
           <h3 className="text-lg font-bold">🔒 دسترسی بررسی کد</h3>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-            مخزن و مدت را شما تعیین می‌کنید؛ مدل فقط می‌تواند برای همین تنظیمات درخواست تأیید ایجاد کند.
+            مخزن و مدت را شما تعیین می‌کنید؛ مدل اجازه تغییر این دو مقدار را ندارد.
           </p>
         </div>
         <span
@@ -407,10 +336,15 @@ export function CodeReviewAccessFa() {
           <div>
             <div className="font-bold">تنظیمات درخواست Code Review</div>
             <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-              این مقادیر برای درخواست‌های بعدی استفاده می‌شوند و مدل اجازه تغییرشان را ندارد.
+              درخواست‌های بعدی فقط برای همین مخزن و همین مدت ساخته می‌شوند.
             </div>
           </div>
-          <span className={`rounded-full px-2 py-1 text-[10px] font-bold ${settingsSaved && !settingsDirty ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300' : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'}`}>
+          <span
+            className={`rounded-full px-2 py-1 text-[10px] font-bold ${
+              settingsSaved && !settingsDirty
+                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
+            }`}>
             {settingsSaved && !settingsDirty ? 'ذخیره‌شده' : 'نیاز به ذخیره'}
           </span>
         </div>
@@ -423,7 +357,10 @@ export function CodeReviewAccessFa() {
               autoComplete="off"
               spellCheck={false}
               value={owner}
-              onChange={event => { setOwner(event.target.value); markSettingsDirty(); }}
+              onChange={event => {
+                setOwner(event.target.value);
+                markSettingsDirty();
+              }}
               placeholder="Adiuse"
               className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-left text-sm text-slate-900 outline-none focus:border-slate-500 dark:border-slate-600 dark:bg-slate-950 dark:text-slate-100"
             />
@@ -436,7 +373,10 @@ export function CodeReviewAccessFa() {
               autoComplete="off"
               spellCheck={false}
               value={repo}
-              onChange={event => { setRepo(event.target.value); markSettingsDirty(); }}
+              onChange={event => {
+                setRepo(event.target.value);
+                markSettingsDirty();
+              }}
               placeholder="cybersecurity"
               className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-left text-sm text-slate-900 outline-none focus:border-slate-500 dark:border-slate-600 dark:bg-slate-950 dark:text-slate-100"
             />
@@ -451,7 +391,10 @@ export function CodeReviewAccessFa() {
                 type="button"
                 key={item}
                 disabled={loading}
-                onClick={() => { setDuration(item); markSettingsDirty(); }}
+                onClick={() => {
+                  setDuration(item);
+                  markSettingsDirty();
+                }}
                 className={`rounded-lg border px-3 py-2 text-sm font-semibold transition disabled:opacity-60 ${
                   duration === item
                     ? 'border-slate-900 bg-slate-900 text-white dark:border-white dark:bg-white dark:text-slate-900'
@@ -495,7 +438,7 @@ export function CodeReviewAccessFa() {
               </div>
             )}
             <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-              فقط ابزارهای مجاز Code Review فعال‌اند؛ تمدید خودکار انجام نمی‌شود.
+              فقط ابزارهای مجاز Read-only فعال‌اند؛ تمدید خودکار انجام نمی‌شود.
             </div>
           </div>
 
@@ -515,7 +458,7 @@ export function CodeReviewAccessFa() {
             <div>
               <div className="font-bold text-amber-950 dark:text-amber-200">درخواست‌های منتظر تأیید</div>
               <div className="mt-1 text-xs leading-5 text-amber-900/70 dark:text-amber-200/70">
-                صف سراسری است؛ هر درخواست از هر گفتگو قابل تأیید یا رد است.
+                صف سراسری است؛ هر درخواست از هر گفت‌وگو قابل تأیید یا رد است.
               </div>
             </div>
             <span className="rounded-full bg-amber-200 px-2.5 py-1 text-xs font-bold text-amber-950 dark:bg-amber-900 dark:text-amber-100">
@@ -528,18 +471,30 @@ export function CodeReviewAccessFa() {
               const busy = requestActionId === request.id;
               const isCurrent = request.sourcePath === currentConversationPath();
               return (
-                <article key={request.id} className="rounded-lg border border-amber-200 bg-white p-3 dark:border-amber-900 dark:bg-slate-900">
+                <article
+                  key={request.id}
+                  className="rounded-lg border border-amber-200 bg-white p-3 dark:border-amber-900 dark:bg-slate-900">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-600 dark:bg-slate-700 dark:text-slate-300">#{index + 1}</span>
-                      {isCurrent && <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-bold text-blue-700 dark:bg-blue-950 dark:text-blue-300">همین گفتگو</span>}
+                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                        #{index + 1}
+                      </span>
+                      {isCurrent && (
+                        <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-bold text-blue-700 dark:bg-blue-950 dark:text-blue-300">
+                          همین گفتگو
+                        </span>
+                      )}
                     </div>
-                    <div dir="ltr" className="mt-2 truncate text-left font-mono text-sm font-bold">{request.owner}/{request.repo}</div>
+                    <div dir="ltr" className="mt-2 truncate text-left font-mono text-sm font-bold">
+                      {request.owner}/{request.repo}
+                    </div>
                     <div className="mt-2 grid gap-1 text-xs text-slate-600 dark:text-slate-300 sm:grid-cols-2">
                       <div>مدت: <strong>{request.durationMinutes} دقیقه</strong></div>
                       <div>درخواست: <strong>{formatRequestedAt(request.requestedAt)}</strong></div>
                     </div>
-                    <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">مبدأ: <span dir="ltr" className="font-mono">{sourceLabel(request)}</span></div>
+                    <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                      مبدأ: <span dir="ltr" className="font-mono">{sourceLabel(request)}</span>
+                    </div>
                   </div>
 
                   <div className="mt-3 flex flex-wrap gap-2">
