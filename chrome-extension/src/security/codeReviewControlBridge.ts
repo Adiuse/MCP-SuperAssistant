@@ -114,6 +114,7 @@ export function registerCodeReviewControlBridge(): void {
           ]);
           return {
             success: true,
+            currentTabId: sender.tab?.id,
             session,
             settings,
             pendingRequests,
@@ -123,13 +124,13 @@ export function registerCodeReviewControlBridge(): void {
 
         case CODE_REVIEW_CONTROL_MESSAGES.SETTINGS: {
           const settings = await getCodeReviewPreferences();
-          return { success: true, settings };
+          return { success: true, currentTabId: sender.tab?.id, settings };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.SAVE_SETTINGS: {
           const input = readSettingsPayload(message);
           const settings = await saveCodeReviewPreferences(input);
-          return { success: true, settings };
+          return { success: true, currentTabId: sender.tab?.id, settings };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REQUEST: {
@@ -140,7 +141,7 @@ export function registerCodeReviewControlBridge(): void {
           const request = await createPendingCodeReviewRequest({
             sourceTabId: tabId,
             sourcePath,
-            sourceKey: sourcePath ? `${tabId}:${sourcePath}` : `tab:${tabId}:${Date.now()}`,
+            sourceKey: sourcePath ? `${tabId}:${sourcePath}` : `tab:${tabId}`,
           });
 
           const sent = await notifyCodeReviewAccessRequested(
@@ -155,7 +156,8 @@ export function registerCodeReviewControlBridge(): void {
             tabId,
             reason: 'access_requested',
           });
-          return { success: true, pendingRequest: request };
+
+          return { success: true, currentTabId: tabId, pendingRequest: request };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.APPROVE: {
@@ -193,7 +195,13 @@ export function registerCodeReviewControlBridge(): void {
           });
 
           const remaining = await getPendingCodeReviewRequests();
-          return { success: true, session, pendingRequests: remaining, pendingRequest: remaining[0] || null };
+          return {
+            success: true,
+            currentTabId: approvingTabId,
+            session,
+            pendingRequests: remaining,
+            pendingRequest: remaining[0] || null,
+          };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REJECT: {
@@ -202,16 +210,22 @@ export function registerCodeReviewControlBridge(): void {
           const rejected = await rejectPendingCodeReviewRequest('explicitly rejected by user', requestId);
           if (!rejected) throw new Error('این درخواست دیگر در صف انتظار وجود ندارد.');
           const remaining = await getPendingCodeReviewRequests();
-          return { success: true, pendingRequests: remaining, pendingRequest: remaining[0] || null, rejected };
+          return {
+            success: true,
+            currentTabId: sender.tab.id,
+            pendingRequests: remaining,
+            pendingRequest: remaining[0] || null,
+            rejected,
+          };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REVOKE: {
-          const active = await getActiveCodeReviewSession();
-          if (active && sender.tab?.id !== undefined && active.approvedTabId !== sender.tab.id) {
-            throw new Error('لغو این نشست فقط از همان تبی که نشست برای آن فعال شده مجاز است.');
-          }
+          if (sender.tab?.id === undefined) throw new Error('لغو دسترسی فقط از داخل تب مرورگر مجاز است.');
 
-          const revoked = await revokeCodeReviewSession('manual revoke from Persian Code Review UI');
+          // Revocation is deliberately global and can be issued from any open
+          // conversation. Restricting a destructive security action to the
+          // original tab would force the user to hunt through chat history.
+          const revoked = await revokeCodeReviewSession('manual global revoke from Persian Code Review UI');
           await clearCodeReviewExpiryNotification();
           const sent = await notifyCodeReviewRevoked(revoked?.owner, revoked?.repo);
           await auditNotificationResult({
@@ -219,22 +233,28 @@ export function registerCodeReviewControlBridge(): void {
             sessionId: revoked?.id,
             owner: revoked?.owner,
             repo: revoked?.repo,
-            tabId: sender.tab?.id,
+            tabId: sender.tab.id,
             reason: 'session_revoked',
           });
 
           const pendingRequests = await getPendingCodeReviewRequests();
-          return { success: true, session: null, pendingRequests, pendingRequest: pendingRequests[0] || null };
+          return {
+            success: true,
+            currentTabId: sender.tab.id,
+            session: null,
+            pendingRequests,
+            pendingRequest: pendingRequests[0] || null,
+          };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.AUDIT: {
           const entries = await getCodeReviewAuditLog();
-          return { success: true, entries: entries.slice(-100) };
+          return { success: true, currentTabId: sender.tab?.id, entries: entries.slice(-100) };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.CLEAR_AUDIT: {
           await clearCodeReviewAuditLog();
-          return { success: true, entries: [] };
+          return { success: true, currentTabId: sender.tab?.id, entries: [] };
         }
 
         default:
