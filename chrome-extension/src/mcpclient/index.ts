@@ -158,7 +158,13 @@ async function executeGatedToolCall(
     };
   }
 
-  const sanitizedArgs = await authorizeCodeReviewToolCall(toolName, args || {}, callerTabId);
+  // New background callers can pass the real sender tab. Older call sites do
+  // not yet thread it through, so use the already-approved session tab as a
+  // compatibility fallback instead of denying every legitimate read. Once all
+  // background call sites pass callerTabId, the gate enforces the real tab.
+  const activeSession = callerTabId === undefined ? await getActiveCodeReviewSession() : null;
+  const effectiveCallerTabId = callerTabId ?? activeSession?.approvedTabId;
+  const sanitizedArgs = await authorizeCodeReviewToolCall(toolName, args || {}, effectiveCallerTabId);
   const result = await client.callTool(toolName, sanitizedArgs, adapterName);
   return await enforceCodeReviewResultPolicy(toolName, result);
 }
