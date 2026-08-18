@@ -5,6 +5,7 @@ const logger = createLogger('CodeReviewNotifications');
 const EXPIRY_ALARM_NAME = 'mcp-code-review-expiry';
 const EXPIRY_NOTICE_KEY = 'mcpCodeReviewExpiryNotice';
 const DENIED_NOTIFICATION_COOLDOWN_MS = 10_000;
+const NOTIFICATION_AUTO_DISMISS_MS = 5_000;
 
 export interface ExpiryNotice {
   sessionId: string;
@@ -30,17 +31,31 @@ function canNotify(): boolean {
   return typeof chrome !== 'undefined' && Boolean(chrome.notifications?.create);
 }
 
+function scheduleNotificationDismiss(notificationId: string): void {
+  globalThis.setTimeout(() => {
+    void chrome.notifications.clear(notificationId).catch(error => {
+      logger.debug('[CodeReviewNotifications] Auto-dismiss skipped:', error);
+    });
+  }, NOTIFICATION_AUTO_DISMISS_MS);
+}
+
 async function createSecurityNotification(title: string, message: string): Promise<boolean> {
   if (!canNotify()) return false;
 
   try {
-    await chrome.notifications.create({
+    const notificationId = await chrome.notifications.create({
       type: 'basic',
       iconUrl: chrome.runtime.getURL('icon-128.png'),
       title,
       message,
       priority: 2,
+      requireInteraction: false,
     });
+
+    if (notificationId) {
+      scheduleNotificationDismiss(notificationId);
+    }
+
     return true;
   } catch (error) {
     logger.warn('[CodeReviewNotifications] Failed to create notification:', error);
