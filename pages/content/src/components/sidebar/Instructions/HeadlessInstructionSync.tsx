@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { useAvailableTools, useCurrentAdapter, useUserPreferences } from '../../../hooks';
 import { useMcpCommunication } from '../../../hooks/useMcpCommunication';
+import { executionTracker } from '../../../render_prescript/src/renderer/functionBlock';
 import { createLogger } from '@extension/shared/lib/logger';
 import { generateInstructionsJson } from './instructionGeneratorJson';
 import { instructionsState } from './InstructionManager';
@@ -75,6 +76,7 @@ type ResumeAttempt = { count: number; nextAt: number };
 
 const resumeInFlightSessions = new Set<string>();
 const resumeAttempts = new Map<string, ResumeAttempt>();
+const surfacedPendingRequestIds = new Set<string>();
 
 function currentConversationPath(): string {
   return `${window.location.pathname}${window.location.search}`;
@@ -167,6 +169,43 @@ function setRenderedReviewState(
   }
 }
 
+function clearReviewRequestExecutionMemory(): void {
+  for (const key of [...executionTracker.executedFunctions]) {
+    if (key.startsWith(`${REVIEW_REQUEST_TOOL}:`)) {
+      executionTracker.executedFunctions.delete(key);
+    }
+  }
+}
+
+function surfacePendingReviewRequest(request: PendingReviewRequest): void {
+  if (!request.id || surfacedPendingRequestIds.has(request.id)) return;
+
+  surfacedPendingRequestIds.add(request.id);
+  if (surfacedPendingRequestIds.size > 100) {
+    const oldest = surfacedPendingRequestIds.values().next().value;
+    if (oldest) surfacedPendingRequestIds.delete(oldest);
+  }
+
+  const owner = request.owner || 'GitHub';
+  const repo = request.repo || 'repository';
+  const duration = Number(request.durationMinutes) || 0;
+
+  emitSecurityToast({
+    id: `pending-review:${request.id}`,
+    title: 'تأیید Code Review لازم است',
+    message: `${owner}/${repo}${duration ? ` — ${duration} دقیقه` : ''}`,
+    variant: 'warning',
+    durationMs: 7000,
+  });
+
+  // A request must never happen silently. Open the MCP/security control center
+  // on the originating conversation so the user immediately sees Approve/Reject.
+  if (!document.getElementById('mcp-popover-portal')) {
+    const controlButton = document.querySelector<HTMLButtonElement>('#mcp-popover-container > button');
+    controlButton?.click();
+  }
+}
+
 function auditFingerprint(entry: ReviewAuditEntry): string {
   return [
     entry.timestamp || 0,
@@ -184,12 +223,8 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
 
   switch (entry.action) {
     case 'access_requested':
-      emitSecurityToast({
-        id: `access-requested:${entry.timestamp || Date.now()}`,
-        title: 'تأیید Code Review لازم است',
-        message: target || 'یک درخواست دسترسی Read-only منتظر تأیید است.',
-        variant: 'warning',
-      });
+      // Pending requests are surfaced directly from authoritative status below.
+      // Avoid duplicate/racy audit toasts for the same request.
       break;
     case 'session_started':
       emitSecurityToast({
@@ -359,7 +394,9 @@ export function HeadlessInstructionSync() {
         const owner = session.owner || 'GitHub';
         const repo = session.repo || 'repository';
         const duration = Number(session.durationMinutes) || 0;
-        const continuation = `${updatedInstructions}\n\n[MCP Approval Result] Code Review access is approved and active for ${owner}/${repo}${duration ? ` for ${duration} minutes` : ''}. Continue the user's pending repository task now using the exposed read-only MCP tools. Do not request access again unless this session expires or is revoked.`;
+        const continuation = `${updatedInstructions}\
+\
+[MCP Approval Result] Code Review access is approved and active for ${owner}/${repo}${duration ? ` for ${duration} minutes` : ''}. Continue the user's pending repository task now using the exposed read-only MCP tools. Do not request access again unless this session expires or is revoked.`;
 
         const inserted = await adapter.insertText(continuation);
         if (!inserted) throw new Error('درج پیام ادامه در چت ناموفق بود.');
@@ -417,10 +454,20 @@ export function HeadlessInstructionSync() {
         const currentTabId = response.currentTabId;
         const path = currentConversationPath();
 
+        // The approval-request tool is intentionally repeatable. Once there is no
+        // active/pending review, forget its in-memory auto-execution signature so a
+        // later model call in the same conversation can create a fresh request.
+        if (!session && pendingRequests.length === 0) {
+          clearReviewRequestExecutionMemory();
+        }
+
         const currentPending = [...pendingRequests]
           .reverse()
           .find(request => !request.sourcePath || request.sourcePath === path);
-        if (currentPending) setRenderedReviewState(currentPending, 'pending');
+        if (currentPending) {
+          setRenderedReviewState(currentPending, 'pending');
+          surfacePendingReviewRequest(currentPending);
+        }
 
         if (session && (session.approvedTabId === currentTabId || session.sourcePath === path)) {
           setRenderedReviewState(session, 'approved');
