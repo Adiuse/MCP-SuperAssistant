@@ -11,6 +11,49 @@ import { createLogger } from '@extension/shared/lib/logger';
 
 const logger = createLogger('mcpPopover');
 
+const embeddedDarkOverrides = `
+[data-mcp-theme="dark"] .bg-white { background-color: #18181b !important; }
+[data-mcp-theme="dark"] .bg-slate-50 { background-color: #111827 !important; }
+[data-mcp-theme="dark"] .bg-slate-100 { background-color: #27272a !important; }
+[data-mcp-theme="dark"] .bg-slate-200 { background-color: #3f3f46 !important; }
+[data-mcp-theme="dark"] .bg-slate-700 { background-color: #3f3f46 !important; }
+[data-mcp-theme="dark"] .bg-slate-800 { background-color: #18181b !important; }
+[data-mcp-theme="dark"] .bg-slate-900 { background-color: #111827 !important; }
+[data-mcp-theme="dark"] .text-slate-900,
+[data-mcp-theme="dark"] .text-slate-800,
+[data-mcp-theme="dark"] .text-slate-700 { color: #f4f4f5 !important; }
+[data-mcp-theme="dark"] .text-slate-600 { color: #d4d4d8 !important; }
+[data-mcp-theme="dark"] .text-slate-500 { color: #a1a1aa !important; }
+[data-mcp-theme="dark"] .text-slate-400 { color: #a1a1aa !important; }
+[data-mcp-theme="dark"] .border-slate-200,
+[data-mcp-theme="dark"] .border-slate-300,
+[data-mcp-theme="dark"] .border-slate-600,
+[data-mcp-theme="dark"] .border-slate-700 { border-color: #3f3f46 !important; }
+[data-mcp-theme="dark"] .bg-emerald-50,
+[data-mcp-theme="dark"] .bg-emerald-100 { background-color: rgba(6, 78, 59, .36) !important; }
+[data-mcp-theme="dark"] .text-emerald-700,
+[data-mcp-theme="dark"] .text-emerald-600 { color: #6ee7b7 !important; }
+[data-mcp-theme="dark"] .border-emerald-200,
+[data-mcp-theme="dark"] .border-emerald-300 { border-color: #065f46 !important; }
+[data-mcp-theme="dark"] .bg-amber-50 { background-color: rgba(120, 53, 15, .38) !important; }
+[data-mcp-theme="dark"] .text-amber-900,
+[data-mcp-theme="dark"] .text-amber-600 { color: #fde68a !important; }
+[data-mcp-theme="dark"] .border-amber-300 { border-color: #92400e !important; }
+[data-mcp-theme="dark"] .bg-red-50 { background-color: rgba(127, 29, 29, .32) !important; }
+[data-mcp-theme="dark"] .text-red-700 { color: #fca5a5 !important; }
+[data-mcp-theme="dark"] .border-red-200,
+[data-mcp-theme="dark"] .border-red-300 { border-color: #7f1d1d !important; }
+[data-mcp-theme="dark"] input,
+[data-mcp-theme="dark"] select,
+[data-mcp-theme="dark"] textarea { background-color: #111827 !important; color: #f4f4f5 !important; border-color: #52525b !important; }
+[data-mcp-theme="dark"] input::placeholder,
+[data-mcp-theme="dark"] textarea::placeholder { color: #71717a !important; }
+[data-mcp-theme="dark"] button.bg-slate-950,
+[data-mcp-theme="dark"] button.bg-slate-900 { background-color: #2563eb !important; color: #ffffff !important; border-color: #3b82f6 !important; }
+[data-mcp-theme="dark"] #mcp-security-center,
+[data-mcp-theme="dark"] #mcp-security-center > div { color: #f4f4f5; }
+`;
+
 export interface MCPToggleState {
   mcpEnabled: boolean;
   autoInsert: boolean;
@@ -398,6 +441,7 @@ export const MCPPopover: React.FC<MCPPopoverProps> = ({ toggleStateManager, adap
         <div
           ref={popoverRef}
           className={isDark ? 'dark' : undefined}
+          data-mcp-theme={isDark ? 'dark' : 'light'}
           dir="rtl"
           style={{
             width: 'min(860px, calc(100vw - 28px))',
@@ -413,6 +457,7 @@ export const MCPPopover: React.FC<MCPPopoverProps> = ({ toggleStateManager, adap
             boxShadow: isDark ? '0 22px 60px rgba(0,0,0,.55)' : '0 22px 60px rgba(15,23,42,.20)',
             fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",Tahoma,sans-serif',
           }}>
+          <style>{embeddedDarkOverrides}</style>
           <header
             style={{
               display: 'flex',
