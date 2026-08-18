@@ -4,6 +4,8 @@ import { useMcpCommunication } from '../../../hooks/useMcpCommunication';
 import { createLogger } from '@extension/shared/lib/logger';
 import { generateInstructionsJson } from './instructionGeneratorJson';
 import { instructionsState } from './InstructionManager';
+import { SecurityToastContainer } from '../../mcpPopover/SecurityToastContainer';
+import { emitSecurityToast } from '../../mcpPopover/securityToast';
 
 const logger = createLogger('HeadlessInstructionSync');
 const REVIEW_REQUEST_TOOL = 'request_code_review_access';
@@ -18,15 +20,32 @@ interface ParsedReviewRequest {
 interface ReviewStatusResponse {
   success?: boolean;
   session?: {
+    id?: string;
     owner?: string;
     repo?: string;
     durationMinutes?: number;
   } | null;
   pendingRequest?: {
+    id?: string;
     owner?: string;
     repo?: string;
     durationMinutes?: number;
   } | null;
+}
+
+interface ReviewAuditEntry {
+  timestamp?: number;
+  action?: string;
+  toolName?: string;
+  owner?: string;
+  repo?: string;
+  reason?: string;
+  resource?: string;
+}
+
+interface ReviewAuditResponse {
+  success?: boolean;
+  entries?: ReviewAuditEntry[];
 }
 
 function parseJsonObjects(text: string): any[] {
@@ -166,10 +185,88 @@ function setRenderedReviewState(
   }
 }
 
+function auditFingerprint(entry: ReviewAuditEntry): string {
+  return [
+    entry.timestamp || 0,
+    entry.action || '',
+    entry.toolName || '',
+    entry.owner || '',
+    entry.repo || '',
+    entry.reason || '',
+    entry.resource || '',
+  ].join('|');
+}
+
+function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
+  const target = entry.owner && entry.repo ? `${entry.owner}/${entry.repo}` : '';
+
+  switch (entry.action) {
+    case 'session_started':
+      emitSecurityToast({
+        id: `session-started:${entry.timestamp || Date.now()}`,
+        title: 'دسترسی GitHub فعال شد',
+        message: target ? `${target} در حالت فقط‌خواندنی فعال شد.` : 'نشست Code Review فعال شد.',
+        variant: 'success',
+      });
+      break;
+
+    case 'session_revoked':
+      emitSecurityToast({
+        id: `session-revoked:${entry.timestamp || Date.now()}`,
+        title: 'دسترسی GitHub لغو شد',
+        message: target ? `دسترسی ${target} فوراً غیرفعال شد.` : 'نشست Code Review لغو شد.',
+        variant: 'info',
+      });
+      break;
+
+    case 'session_expired':
+      emitSecurityToast({
+        id: `session-expired:${entry.timestamp || Date.now()}`,
+        title: 'زمان دسترسی پایان یافت',
+        message: target ? `دسترسی ${target} منقضی شد.` : 'نشست Code Review منقضی شد.',
+        variant: 'warning',
+      });
+      break;
+
+    case 'access_rejected':
+      emitSecurityToast({
+        id: `access-rejected:${entry.timestamp || Date.now()}`,
+        title: 'درخواست دسترسی رد شد',
+        message: target || entry.reason || 'درخواست Code Review توسط شما رد شد.',
+        variant: 'warning',
+      });
+      break;
+
+    case 'tool_denied':
+    case 'response_denied':
+      emitSecurityToast({
+        id: `security-denied:${entry.timestamp || Date.now()}:${entry.toolName || entry.action}`,
+        title: 'درخواست امنیتی مسدود شد',
+        message: [entry.toolName, entry.resource, entry.reason].filter(Boolean).join(' — ') || 'Gate این عملیات را مسدود کرد.',
+        variant: 'error',
+        durationMs: 6500,
+      });
+      break;
+
+    case 'notification_failed':
+      emitSecurityToast({
+        id: `notification-failed:${entry.timestamp || Date.now()}`,
+        title: 'ارسال اعلان سیستم ناموفق بود',
+        message: entry.reason || 'اعلان سیستم‌عامل ارسال نشد؛ وضعیت امنیتی داخل MCP همچنان معتبر است.',
+        variant: 'warning',
+      });
+      break;
+
+    default:
+      break;
+  }
+}
+
 /**
  * Keeps MCP instructions generated and synchronized without rendering the old
  * sidebar Instructions UI. It also recognizes the single safe local approval
- * tool directly from the raw ChatGPT <pre> block.
+ * tool directly from the raw ChatGPT <pre> block and owns the global security
+ * toaster used by the unified MCP interface.
  *
  * Important: this does NOT grant GitHub access. It only executes the synthetic
  * request_code_review_access tool, whose gated implementation creates a local
@@ -183,6 +280,8 @@ export function HeadlessInstructionSync() {
   const processedSources = useRef<WeakSet<HTMLElement>>(new WeakSet());
   const inFlightKeys = useRef<Set<string>>(new Set());
   const knownRequests = useRef<Map<string, ParsedReviewRequest>>(new Map());
+  const seenAuditEntries = useRef<Set<string>>(new Set());
+  const auditSeeded = useRef(false);
 
   useEffect(() => {
     if (!isInitialized || !isConnected || refreshedForConnection.current) return;
@@ -230,6 +329,13 @@ export function HeadlessInstructionSync() {
         await dispatchReviewRequest(request);
         source.setAttribute('data-review-request-dispatched', 'true');
 
+        emitSecurityToast({
+          id: `access-request:${requestKey}`,
+          title: 'تأیید Code Review لازم است',
+          message: `${request.owner}/${request.repo} — ${request.durationMinutes} دقیقه، فقط‌خواندنی`,
+          variant: 'warning',
+        });
+
         // Rendering of the generic function card can finish a few ticks after
         // the raw <pre> has been parsed, so update both immediately and shortly
         // afterwards.
@@ -238,10 +344,15 @@ export function HeadlessInstructionSync() {
         window.setTimeout(() => setRenderedReviewState(request, 'pending'), 500);
       } catch (error) {
         processedSources.current.delete(source);
-        logger.warn(
-          '[HeadlessInstructionSync] Local approval request dispatch failed:',
-          error instanceof Error ? error.message : String(error),
-        );
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn('[HeadlessInstructionSync] Local approval request dispatch failed:', message);
+        emitSecurityToast({
+          id: `access-request-error:${requestKey}`,
+          title: 'ثبت درخواست دسترسی ناموفق بود',
+          message,
+          variant: 'error',
+          durationMs: 6500,
+        });
       } finally {
         inFlightKeys.current.delete(requestKey);
       }
@@ -255,7 +366,7 @@ export function HeadlessInstructionSync() {
     };
 
     const syncApprovalState = async () => {
-      if (disposed || knownRequests.current.size === 0) return;
+      if (disposed) return;
 
       try {
         const response = (await chrome.runtime.sendMessage({
@@ -279,6 +390,42 @@ export function HeadlessInstructionSync() {
       }
     };
 
+    const syncSecurityToasts = async () => {
+      if (disposed) return;
+
+      try {
+        const response = (await chrome.runtime.sendMessage({
+          type: 'code-review:get-audit',
+        })) as ReviewAuditResponse;
+
+        if (!response?.success || !Array.isArray(response.entries)) return;
+
+        if (!auditSeeded.current) {
+          response.entries.forEach(entry => seenAuditEntries.current.add(auditFingerprint(entry)));
+          auditSeeded.current = true;
+          return;
+        }
+
+        for (const entry of response.entries) {
+          const fingerprint = auditFingerprint(entry);
+          if (seenAuditEntries.current.has(fingerprint)) continue;
+          seenAuditEntries.current.add(fingerprint);
+          emitToastForAuditEntry(entry);
+        }
+
+        // Keep this bounded for long-running tabs.
+        if (seenAuditEntries.current.size > 500) {
+          const latest = response.entries.map(auditFingerprint);
+          seenAuditEntries.current = new Set(latest);
+        }
+      } catch (error) {
+        logger.debug(
+          '[HeadlessInstructionSync] Security-toast audit sync skipped:',
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    };
+
     const scheduleScan = () => {
       if (scanScheduled || disposed) return;
       scanScheduled = true;
@@ -290,6 +437,7 @@ export function HeadlessInstructionSync() {
 
     scan();
     void syncApprovalState();
+    void syncSecurityToasts();
 
     const observer = new MutationObserver(scheduleScan);
     observer.observe(document.body, {
@@ -299,11 +447,13 @@ export function HeadlessInstructionSync() {
     });
 
     const approvalPoll = window.setInterval(() => void syncApprovalState(), 500);
+    const auditPoll = window.setInterval(() => void syncSecurityToasts(), 1000);
 
     return () => {
       disposed = true;
       observer.disconnect();
       window.clearInterval(approvalPoll);
+      window.clearInterval(auditPoll);
     };
   }, [isConnected, isInitialized]);
 
@@ -337,5 +487,5 @@ export function HeadlessInstructionSync() {
     );
   }, [generatedInstructions, instructionTools.length]);
 
-  return null;
+  return <SecurityToastContainer />;
 }
