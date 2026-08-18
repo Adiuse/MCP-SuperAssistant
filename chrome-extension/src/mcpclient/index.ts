@@ -19,7 +19,7 @@ import {
   filterCodeReviewTools,
   getActiveCodeReviewSession,
   getCodeReviewRequestTool,
-  getPendingCodeReviewRequest,
+  getPendingCodeReviewRequests,
   recordCodeReviewAuditEvent,
 } from '../security/codeReviewGate.js';
 import { notifyCodeReviewAccessRequested } from '../security/codeReviewNotifications.js';
@@ -37,7 +37,7 @@ export type {
   ITransportPlugin,
   PluginMetadata,
   PluginConfig,
-  TransportType
+  TransportType,
 } from './types/plugin.js';
 
 export type {
@@ -45,7 +45,7 @@ export type {
   ConnectionRequest,
   SSEPluginConfig,
   WebSocketPluginConfig,
-  GlobalConfig
+  GlobalConfig,
 } from './types/config.js';
 
 export type {
@@ -53,7 +53,7 @@ export type {
   NormalizedTool,
   PrimitivesResponse,
   ToolCallRequest,
-  ToolCallResult
+  ToolCallResult,
 } from './types/primitives.js';
 
 export type { AllEvents } from './types/events.js';
@@ -84,11 +84,13 @@ function setupGlobalClientEventListeners(client: McpClient): void {
     }
 
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-      chrome.runtime.sendMessage({
-        type: 'mcp:connection-status-changed',
-        payload: event,
-        origin: 'mcpclient',
-      }).catch(() => {});
+      chrome.runtime
+        .sendMessage({
+          type: 'mcp:connection-status-changed',
+          payload: event,
+          origin: 'mcpclient',
+        })
+        .catch(() => {});
     }
   });
 
@@ -113,21 +115,40 @@ function detectTransportType(uri: string): import('./types/plugin.js').Transport
   }
 }
 
+function safeSourcePath(url?: string): string | undefined {
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url);
+    return `${parsed.pathname}${parsed.search}`.slice(0, 500);
+  } catch {
+    return undefined;
+  }
+}
+
 async function executeGatedToolCall(
   client: McpClient,
   toolName: string,
   args: { [key: string]: unknown },
   adapterName?: string,
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any> {
   if (toolName === CODE_REVIEW_REQUEST_TOOL_NAME) {
-    const existingPending = await getPendingCodeReviewRequest();
+    const pendingBefore = await getPendingCodeReviewRequests();
+    const sourcePath = safeSourcePath(callerSourceUrl);
     const request = await createPendingCodeReviewRequest({
       sourceTabId: callerTabId,
-      sourceKey: callerTabId === undefined ? undefined : `tab:${callerTabId}`,
+      sourcePath,
+      sourceKey:
+        callerTabId === undefined
+          ? undefined
+          : sourcePath
+            ? `${callerTabId}:${sourcePath}`
+            : `tab:${callerTabId}`,
     });
 
-    if (!existingPending) {
+    const wasAlreadyPending = pendingBefore.some(item => item.id === request.id);
+    if (!wasAlreadyPending) {
       const sent = await notifyCodeReviewAccessRequested(
         request.owner,
         request.repo,
@@ -158,30 +179,34 @@ async function executeGatedToolCall(
     };
   }
 
-  // New background callers can pass the real sender tab. Older call sites do
-  // not yet thread it through, so use the already-approved session tab as a
-  // compatibility fallback instead of denying every legitimate read. Once all
-  // background call sites pass callerTabId, the gate enforces the real tab.
-  const activeSession = callerTabId === undefined ? await getActiveCodeReviewSession() : null;
-  const effectiveCallerTabId = callerTabId ?? activeSession?.approvedTabId;
-  const sanitizedArgs = await authorizeCodeReviewToolCall(toolName, args || {}, effectiveCallerTabId);
+  // Read operations are authorized against the real content-script sender tab.
+  // No compatibility fallback is used: if callerTabId is absent or different
+  // from the tab bound to the approved session, the gate denies the call.
+  const sanitizedArgs = await authorizeCodeReviewToolCall(toolName, args || {}, callerTabId);
   const result = await client.callTool(toolName, sanitizedArgs, adapterName);
   return await enforceCodeReviewResultPolicy(toolName, result);
 }
 
-async function getGatedPrimitives(client: McpClient, forceRefresh: boolean): Promise<any[]> {
+async function getGatedPrimitives(
+  client: McpClient,
+  forceRefresh: boolean,
+  callerTabId?: number,
+): Promise<any[]> {
   const session = await getActiveCodeReviewSession();
 
   if (!session) {
     return [{ type: 'tool', value: await getCodeReviewRequestTool() }];
   }
 
+  // An active Code Review session is intentionally visible in the security UI
+  // everywhere, but its GitHub tools are exposed only to the originating tab.
+  if (callerTabId === undefined || callerTabId !== session.approvedTabId) {
+    return [];
+  }
+
   const response = await client.getPrimitives(forceRefresh);
   const tools = await filterCodeReviewTools(response.tools);
-
-  const primitives: any[] = [];
-  tools.forEach(tool => primitives.push({ type: 'tool', value: tool }));
-  return primitives;
+  return tools.map(tool => ({ type: 'tool', value: tool }));
 }
 
 export function isMcpServerConnected(): boolean {
@@ -206,24 +231,33 @@ export async function callToolWithBackwardsCompatibility(
   adapterName?: string,
   transportType?: import('./types/plugin.js').TransportType,
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any> {
   const client = await getGlobalClient();
   const type = transportType || detectTransportType(uri);
 
   if (!client.isConnected()) await client.connect({ uri, type });
-  return await executeGatedToolCall(client, toolName, args, adapterName, callerTabId);
+  return await executeGatedToolCall(
+    client,
+    toolName,
+    args,
+    adapterName,
+    callerTabId,
+    callerSourceUrl,
+  );
 }
 
 export async function getPrimitivesWithBackwardsCompatibility(
   uri: string,
   forceRefresh: boolean = false,
-  transportType?: import('./types/plugin.js').TransportType
+  transportType?: import('./types/plugin.js').TransportType,
+  callerTabId?: number,
 ): Promise<any[]> {
   const client = await getGlobalClient();
   const type = transportType || detectTransportType(uri);
 
   if (!client.isConnected()) await client.connect({ uri, type });
-  return await getGatedPrimitives(client, forceRefresh);
+  return await getGatedPrimitives(client, forceRefresh, callerTabId);
 }
 
 export async function forceReconnectToMcpServer(
@@ -247,7 +281,7 @@ export async function runWithBackwardsCompatibility(
   await client.connect({ uri, type });
   const primitives = await getGatedPrimitives(client, false);
   const toolCount = primitives.filter(p => p.type === 'tool').length;
-  logger.debug(`Connected, ${toolCount} Code Review tools currently exposed`);
+  logger.debug(`Connected, ${toolCount} globally broadcastable Code Review tools currently exposed`);
 }
 
 export function resetMcpConnectionState(): void {
@@ -289,19 +323,28 @@ export async function callToolWithWebSocket(
   toolName: string,
   args: { [key: string]: unknown },
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any> {
   const client = await getGlobalClient();
   await client.connect({ uri, type: 'websocket' });
-  return await executeGatedToolCall(client, toolName, args, undefined, callerTabId);
+  return await executeGatedToolCall(
+    client,
+    toolName,
+    args,
+    undefined,
+    callerTabId,
+    callerSourceUrl,
+  );
 }
 
 export async function getPrimitivesWithWebSocket(
   uri: string,
-  forceRefresh: boolean = false
+  forceRefresh: boolean = false,
+  callerTabId?: number,
 ): Promise<any[]> {
   const client = await getGlobalClient();
   await client.connect({ uri, type: 'websocket' });
-  return await getGatedPrimitives(client, forceRefresh);
+  return await getGatedPrimitives(client, forceRefresh, callerTabId);
 }
 
 export function normalizeToolsFromPrimitives(primitives: any[]): any[] {
@@ -313,10 +356,13 @@ export function normalizeToolsFromPrimitives(primitives: any[]): any[] {
         name: tool.name,
         description: tool.description || '',
         input_schema: tool.inputSchema || tool.input_schema || {},
-        schema: tool.inputSchema ? JSON.stringify(tool.inputSchema) :
-                tool.input_schema ? JSON.stringify(tool.input_schema) : '{}',
+        schema: tool.inputSchema
+          ? JSON.stringify(tool.inputSchema)
+          : tool.input_schema
+            ? JSON.stringify(tool.input_schema)
+            : '{}',
         ...(tool.uri && { uri: tool.uri }),
-        ...(tool.arguments && { arguments: tool.arguments })
+        ...(tool.arguments && { arguments: tool.arguments }),
       };
     });
 }
