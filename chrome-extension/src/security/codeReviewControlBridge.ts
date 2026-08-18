@@ -48,7 +48,10 @@ let bridgeRegistered = false;
 const callerContextQueues = new Map<string, CodeReviewCallerContext[]>();
 
 function stableSerialize(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (value === null || typeof value !== 'object') {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? String(value) : serialized;
+  }
   if (Array.isArray(value)) return `[${value.map(stableSerialize).join(',')}]`;
 
   const record = value as Record<string, unknown>;
@@ -184,10 +187,6 @@ export function registerCodeReviewControlBridge(): void {
   });
 
   chrome.runtime.onMessage.addListener((message: any, sender, sendResponse) => {
-    // This listener is registered while the MCP module is imported, before the
-    // legacy background MCP handler. Capture trusted sender metadata here so the
-    // gated execution layer can consume the real tab context without trusting
-    // model-provided arguments.
     if (message?.type === 'mcp:call-tool') {
       const toolName = message.payload?.toolName;
       if (typeof toolName === 'string' && toolName) {
