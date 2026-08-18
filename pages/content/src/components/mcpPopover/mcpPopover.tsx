@@ -46,17 +46,82 @@ interface ToggleItemProps {
   isDark: boolean;
 }
 
+function parseRgbBrightness(value: string): number | null {
+  const match = value.match(/rgba?\((\d+)[,\s]+(\d+)[,\s]+(\d+)/i);
+  if (!match) return null;
+  const r = Number(match[1]);
+  const g = Number(match[2]);
+  const b = Number(match[3]);
+  return (r * 299 + g * 587 + b * 114) / 1000;
+}
+
+function detectHostDarkTheme(): boolean {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return false;
+
+  const html = document.documentElement;
+  const body = document.body;
+  const explicitValues = [
+    html.getAttribute('data-theme'),
+    body?.getAttribute('data-theme'),
+    html.getAttribute('data-color-scheme'),
+    body?.getAttribute('data-color-scheme'),
+    html.getAttribute('data-color-mode'),
+    body?.getAttribute('data-color-mode'),
+    html.style.colorScheme,
+    body?.style.colorScheme,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  if (explicitValues.includes('dark')) return true;
+  if (explicitValues.includes('light')) return false;
+
+  const classText = `${html.className || ''} ${body?.className || ''}`.toLowerCase();
+  if (/(^|\s)(dark|theme-dark|dark-theme|dark-mode)(\s|$)/.test(classText)) return true;
+  if (/(^|\s)(light|theme-light|light-theme|light-mode)(\s|$)/.test(classText)) return false;
+
+  const candidates = [body, document.querySelector('main'), document.querySelector('[role="main"]')].filter(
+    Boolean,
+  ) as Element[];
+  for (const element of candidates) {
+    const background = window.getComputedStyle(element).backgroundColor;
+    if (!background || background === 'transparent' || background === 'rgba(0, 0, 0, 0)') continue;
+    const brightness = parseRgbBrightness(background);
+    if (brightness !== null) return brightness < 145;
+  }
+
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
+}
+
 const useThemeDetector = () => {
-  const [isDark, setIsDark] = useState(
-    typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches,
-  );
+  const [isDark, setIsDark] = useState(() => detectHostDarkTheme());
 
   useEffect(() => {
+    const update = () => setIsDark(detectHostDarkTheme());
+    update();
+
     const media = window.matchMedia?.('(prefers-color-scheme: dark)');
-    if (!media) return;
-    const onChange = (event: MediaQueryListEvent) => setIsDark(event.matches);
-    media.addEventListener('change', onChange);
-    return () => media.removeEventListener('change', onChange);
+    media?.addEventListener('change', update);
+
+    const observer = new MutationObserver(update);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class', 'style', 'data-theme', 'data-color-scheme', 'data-color-mode'],
+    });
+    if (document.body) {
+      observer.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme', 'data-color-scheme', 'data-color-mode'],
+      });
+    }
+
+    const interval = window.setInterval(update, 1200);
+    return () => {
+      media?.removeEventListener('change', update);
+      observer.disconnect();
+      window.clearInterval(interval);
+    };
   }, []);
 
   return isDark;
@@ -332,6 +397,7 @@ export const MCPPopover: React.FC<MCPPopoverProps> = ({ toggleStateManager, adap
       <PopoverPortal isOpen={isOpen} triggerRef={buttonRef}>
         <div
           ref={popoverRef}
+          className={isDark ? 'dark' : undefined}
           dir="rtl"
           style={{
             width: 'min(860px, calc(100vw - 28px))',
@@ -343,6 +409,7 @@ export const MCPPopover: React.FC<MCPPopoverProps> = ({ toggleStateManager, adap
             border: `1px solid ${colors.border}`,
             background: colors.panel,
             color: colors.text,
+            colorScheme: isDark ? 'dark' : 'light',
             boxShadow: isDark ? '0 22px 60px rgba(0,0,0,.55)' : '0 22px 60px rgba(15,23,42,.20)',
             fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",Tahoma,sans-serif',
           }}>
