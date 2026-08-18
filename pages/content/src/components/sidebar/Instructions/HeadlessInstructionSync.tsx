@@ -17,6 +17,14 @@ interface ParsedReviewRequest {
   durationMinutes: 5 | 10 | 20;
 }
 
+interface PendingReviewRequest {
+  id?: string;
+  owner?: string;
+  repo?: string;
+  durationMinutes?: number;
+  sourcePath?: string;
+}
+
 interface ReviewStatusResponse {
   success?: boolean;
   session?: {
@@ -24,13 +32,10 @@ interface ReviewStatusResponse {
     owner?: string;
     repo?: string;
     durationMinutes?: number;
+    sourcePath?: string;
   } | null;
-  pendingRequest?: {
-    id?: string;
-    owner?: string;
-    repo?: string;
-    durationMinutes?: number;
-  } | null;
+  pendingRequests?: PendingReviewRequest[];
+  pendingRequest?: PendingReviewRequest | null;
 }
 
 interface ReviewAuditEntry {
@@ -46,6 +51,10 @@ interface ReviewAuditEntry {
 interface ReviewAuditResponse {
   success?: boolean;
   entries?: ReviewAuditEntry[];
+}
+
+function currentConversationPath(): string {
+  return `${window.location.pathname}${window.location.search}`;
 }
 
 function parseJsonObjects(text: string): any[] {
@@ -95,16 +104,13 @@ function parseReviewRequest(text: string): ParsedReviewRequest | null {
 }
 
 async function dispatchReviewRequest(request: ParsedReviewRequest): Promise<void> {
+  // Route approval requests through the code-review control bridge instead of
+  // the generic tool execution path. The bridge sees sender.tab and sender.tab.url,
+  // so the global queue can retain the originating tab/conversation while still
+  // being manageable from every other chat.
   const response = await chrome.runtime.sendMessage({
-    type: 'mcp:call-tool',
-    origin: 'content',
-    timestamp: Date.now(),
-    expectResponse: true,
-    payload: {
-      toolName: REVIEW_REQUEST_TOOL,
-      args: request,
-      adapterName: 'security-approval',
-    },
+    type: 'code-review:request',
+    payload: request,
   });
 
   if (!response?.success) {
@@ -170,9 +176,6 @@ function setRenderedReviewState(
       status.style.border = '1px solid rgba(16, 185, 129, 0.45)';
       status.style.color = 'inherit';
 
-      // A second execution of the access-request tool would only create a new
-      // pending request, so disable the generic Run/Re-execute controls after
-      // approval. GitHub reads continue through the newly exposed read tools.
       block.querySelectorAll<HTMLButtonElement>('button').forEach(button => {
         const label = (button.textContent || '').trim().toLowerCase();
         if (label === 'run' || label === 're-execute' || label.includes('re-execute')) {
@@ -252,7 +255,7 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
       emitSecurityToast({
         id: `notification-failed:${entry.timestamp || Date.now()}`,
         title: 'ارسال اعلان سیستم ناموفق بود',
-        message: entry.reason || 'اعلان سیستم‌عامل ارسال نشد؛ وضعیت امنیتی داخل MCP همچنان معتبر است.',
+        message: entry.reason || 'وضعیت امنیتی داخل MCP همچنان معتبر است.',
         variant: 'warning',
       });
       break;
@@ -264,13 +267,12 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
 
 /**
  * Keeps MCP instructions generated and synchronized without rendering the old
- * sidebar Instructions UI. It also recognizes the single safe local approval
- * tool directly from the raw ChatGPT <pre> block and owns the global security
- * toaster used by the unified MCP interface.
+ * sidebar Instructions UI. It recognizes the safe local approval tool directly
+ * from raw ChatGPT output, creates a globally visible pending request bound to
+ * its originating chat, and owns the global security toaster.
  *
- * Important: this does NOT grant GitHub access. It only executes the synthetic
- * request_code_review_access tool, whose gated implementation creates a local
- * pending request. GitHub read tools remain unavailable until the user approves.
+ * Important: this does NOT grant GitHub access. GitHub read tools remain
+ * unavailable until the user explicitly approves a specific queued request.
  */
 export function HeadlessInstructionSync() {
   const { tools } = useAvailableTools();
@@ -297,9 +299,7 @@ export function HeadlessInstructionSync() {
   }, [isConnected, isInitialized, refreshTools]);
 
   useEffect(() => {
-    if (!isConnected) {
-      refreshedForConnection.current = false;
-    }
+    if (!isConnected) refreshedForConnection.current = false;
   }, [isConnected]);
 
   useEffect(() => {
@@ -310,12 +310,14 @@ export function HeadlessInstructionSync() {
 
     const processSource = async (source: HTMLElement) => {
       if (processedSources.current.has(source)) return;
+      if (source.getAttribute('data-review-request-dispatched') === 'true') return;
       if (source.closest('.function-block')) return;
 
       const request = parseReviewRequest(source.textContent || '');
       if (!request) return;
 
-      const requestKey = `${request.owner.toLowerCase()}/${request.repo.toLowerCase()}:${request.durationMinutes}`;
+      const path = currentConversationPath();
+      const requestKey = `${path}:${request.owner.toLowerCase()}/${request.repo.toLowerCase()}:${request.durationMinutes}`;
       knownRequests.current.set(requestKey, request);
       if (inFlightKeys.current.has(requestKey)) return;
 
@@ -324,7 +326,7 @@ export function HeadlessInstructionSync() {
 
       try {
         logger.debug(
-          `[HeadlessInstructionSync] Dispatching local approval request for ${request.owner}/${request.repo} (${request.durationMinutes}m)`,
+          `[HeadlessInstructionSync] Queueing approval request for ${request.owner}/${request.repo} (${request.durationMinutes}m) from ${path}`,
         );
         await dispatchReviewRequest(request);
         source.setAttribute('data-review-request-dispatched', 'true');
@@ -336,9 +338,6 @@ export function HeadlessInstructionSync() {
           variant: 'warning',
         });
 
-        // Rendering of the generic function card can finish a few ticks after
-        // the raw <pre> has been parsed, so update both immediately and shortly
-        // afterwards.
         setRenderedReviewState(request, 'pending');
         window.setTimeout(() => setRenderedReviewState(request, 'pending'), 100);
         window.setTimeout(() => setRenderedReviewState(request, 'pending'), 500);
@@ -374,11 +373,16 @@ export function HeadlessInstructionSync() {
         })) as ReviewStatusResponse;
 
         if (!response?.success) return;
+        const pendingRequests = Array.isArray(response.pendingRequests)
+          ? response.pendingRequests
+          : response.pendingRequest
+            ? [response.pendingRequest]
+            : [];
 
         for (const request of knownRequests.current.values()) {
           if (requestMatches(response.session, request)) {
             setRenderedReviewState(request, 'approved');
-          } else if (requestMatches(response.pendingRequest, request)) {
+          } else if (pendingRequests.some(candidate => requestMatches(candidate, request))) {
             setRenderedReviewState(request, 'pending');
           }
         }
@@ -413,10 +417,8 @@ export function HeadlessInstructionSync() {
           emitToastForAuditEntry(entry);
         }
 
-        // Keep this bounded for long-running tabs.
         if (seenAuditEntries.current.size > 500) {
-          const latest = response.entries.map(auditFingerprint);
-          seenAuditEntries.current = new Set(latest);
+          seenAuditEntries.current = new Set(response.entries.map(auditFingerprint));
         }
       } catch (error) {
         logger.debug(
