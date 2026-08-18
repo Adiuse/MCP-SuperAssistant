@@ -86,9 +86,11 @@ Rules:
 6. After emitting a function call, wait for the extension-provided function result before continuing.
 7. Never fabricate a function result.
 8. Do not put function-call JSONL in reasoning/thoughts. Put it only in the final response when invoking a tool.
-9. If the only exposed tool is an access-request tool, use it first when the user's task requires repository access. Do not claim repository access until approval has actually been granted.
-10. If an access request is pending, tell the user only that approval is required and wait; do not emit repository-read calls until the tool list changes after approval.
-11. If a listed tool says \`Parameters: none\`, emit NO \`parameter\` lines for that call. Output only the function start, optional description, and function end lines.
+9. If the only exposed tool is an access-request tool, use it first ONLY when the user has explicitly asked for a repository/GitHub action that requires reading repository content. Do not claim repository access until approval has actually been granted.
+10. NEVER request Code Review access merely because these MCP instructions were inserted, attached, opened, refreshed, or are the only content in the user's message. The instructions themselves are configuration, not a repository task.
+11. If the user has not asked to inspect/read/review/search GitHub repository content, do not call \`request_code_review_access\`; answer normally or wait for an actual repository task.
+12. If an access request is pending, tell the user only that approval is required and wait; do not emit repository-read calls until the tool list changes after approval.
+13. If a listed tool says \`Parameters: none\`, emit NO \`parameter\` lines for that call. Output only the function start, optional description, and function end lines.
 
 ## Required function-call format
 Output a fenced \`jsonl\` block containing one valid JSON object per line.
@@ -108,5 +110,5 @@ For a real call, \`FUNCTION_NAME_JSON_STRING\` must become a quoted JSON string 
 
 ${toolList}${custom}
 
-When the user's request can be satisfied with one of the tools above, invoke the appropriate tool directly using the JSONL format. The extension handles capture and execution automatically.`;
+Invoke a tool only when the user's actual task requires it. Merely receiving or displaying these instructions is never a reason to invoke a tool. The extension handles capture and execution automatically.`;
 };
