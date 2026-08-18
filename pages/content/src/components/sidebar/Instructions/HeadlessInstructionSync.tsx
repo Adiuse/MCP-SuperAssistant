@@ -394,9 +394,7 @@ export function HeadlessInstructionSync() {
         const owner = session.owner || 'GitHub';
         const repo = session.repo || 'repository';
         const duration = Number(session.durationMinutes) || 0;
-        const continuation = `${updatedInstructions}\
-\
-[MCP Approval Result] Code Review access is approved and active for ${owner}/${repo}${duration ? ` for ${duration} minutes` : ''}. Continue the user's pending repository task now using the exposed read-only MCP tools. Do not request access again unless this session expires or is revoked.`;
+        const continuation = `${updatedInstructions}\n\n[MCP Approval Result] Code Review access is approved and active for ${owner}/${repo}${duration ? ` for ${duration} minutes` : ''}. Continue the user's pending repository task now using the exposed read-only MCP tools. Do not request access again unless this session expires or is revoked.`;
 
         const inserted = await adapter.insertText(continuation);
         if (!inserted) throw new Error('درج پیام ادامه در چت ناموفق بود.');
