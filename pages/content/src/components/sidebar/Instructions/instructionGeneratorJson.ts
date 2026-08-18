@@ -90,16 +90,18 @@ Rules:
 10. If an access request is pending, tell the user only that approval is required and wait; do not emit repository-read calls until the tool list changes after approval.
 
 ## Required function-call format
-Output a fenced \`jsonl\` block containing one JSON object per line:
+Output a fenced \`jsonl\` block containing one valid JSON object per line.
 
-\`\`\`jsonl
-{"type":"function_call_start","name":"FUNCTION_NAME","call_id":1}
+The template below is intentionally NOT valid JSON so MCP SuperAssistant will never execute the documentation example itself. Replace every bare placeholder with a valid JSON value before outputting a real call:
+
+\`\`\`text
+{"type":"function_call_start","name":FUNCTION_NAME_JSON_STRING,"call_id":1}
 {"type":"description","text":"Short description of the requested action"}
-{"type":"parameter","key":"PARAMETER_NAME","value":"PARAMETER_VALUE"}
+{"type":"parameter","key":PARAMETER_NAME_JSON_STRING,"value":PARAMETER_VALUE_JSON}
 {"type":"function_call_end","call_id":1}
 \`\`\`
 
-Use one \`parameter\` line for each parameter. Preserve JSON types in \`value\`: strings as strings, numbers as numbers, booleans as booleans, and arrays/objects as valid JSON values. Increment \`call_id\` for each later tool call in the conversation.
+For a real call, \`FUNCTION_NAME_JSON_STRING\` must become a quoted JSON string such as \`"request_code_review_access"\`. \`PARAMETER_NAME_JSON_STRING\` must become a quoted parameter name, and \`PARAMETER_VALUE_JSON\` must become the actual JSON value. Use one \`parameter\` line for each parameter. Preserve JSON types in \`value\`: strings as strings, numbers as numbers, booleans as booleans, and arrays/objects as valid JSON values. Increment \`call_id\` for each later tool call in the conversation.
 
 ## Available MCP tools
 
