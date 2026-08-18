@@ -275,7 +275,7 @@ async function waitForReadInstructions(timeoutMs = 6000): Promise<string> {
 }
 
 export function HeadlessInstructionSync() {
-  const { tools } = useAvailableTools();
+  const { tools, setAvailableTools } = useAvailableTools();
   const { preferences } = useUserPreferences();
   const { isInitialized, isConnected, refreshTools } = useMcpCommunication();
   const { insertText, submitForm, isReady } = useCurrentAdapter();
@@ -432,21 +432,26 @@ export function HeadlessInstructionSync() {
           session && currentTabId !== undefined && session.approvedTabId === currentTabId,
         );
 
-        const toolScopeMismatch = session
-          ? sessionIsForThisTab
-            ? !hasReadTools
-            : currentTools.length > 0
-          : !hasRequestTool;
-
         let refreshedTools: Array<{ name?: string }> | undefined;
-        if (sessionChanged || toolScopeMismatch) {
-          try {
-            refreshedTools = await refreshTools(true);
-          } catch (error) {
-            logger.debug(
-              '[HeadlessInstructionSync] Gated tool refresh failed:',
-              error instanceof Error ? error.message : String(error),
-            );
+
+        if (session && !sessionIsForThisTab) {
+          // Legacy background broadcasts are global. Do not let a read-tool list
+          // from another tab leak into this chat's model instructions.
+          if (currentTools.length > 0) {
+            setAvailableTools([]);
+            toolsRef.current = [];
+          }
+        } else {
+          const toolScopeMismatch = session ? !hasReadTools : !hasRequestTool;
+          if (sessionChanged || toolScopeMismatch) {
+            try {
+              refreshedTools = await refreshTools(true);
+            } catch (error) {
+              logger.debug(
+                '[HeadlessInstructionSync] Gated tool refresh failed:',
+                error instanceof Error ? error.message : String(error),
+              );
+            }
           }
         }
 
@@ -521,7 +526,7 @@ export function HeadlessInstructionSync() {
       window.clearInterval(approvalPoll);
       window.clearInterval(auditPoll);
     };
-  }, [isConnected, isInitialized, refreshTools]);
+  }, [isConnected, isInitialized, refreshTools, setAvailableTools]);
 
   const instructionTools = useMemo(
     () =>
