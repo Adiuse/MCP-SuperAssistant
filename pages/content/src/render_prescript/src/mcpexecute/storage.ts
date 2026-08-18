@@ -24,6 +24,7 @@ interface URLBasedFunctionHistory {
 
 // Storage key for the executed functions
 const STORAGE_KEY = 'mcp_url_based_function_history';
+const CODE_REVIEW_REQUEST_TOOL = 'request_code_review_access';
 
 /**
  * Store information about an executed function with race condition prevention
@@ -170,7 +171,6 @@ export const getExecutedFunctionsForCurrentUrl = (): ExecutedFunction[] => {
 export const getExecutedFunctionsForUrl = (url: string): ExecutedFunction[] => {
   const storage = getURLBasedStorage();
 
-  // Direct access to URL's functions
   if (!storage[url]) {
     return [];
   }
@@ -191,6 +191,13 @@ export const getPreviousExecution = (
   callId: string,
   contentSignature: string,
 ): ExecutedFunction | null => {
+  // Access approval is an ephemeral security request, not a reusable tool result.
+  // The model commonly restarts call_id at 1, so persisting this execution would
+  // incorrectly suppress a new approval request after a rejection, revoke, or expiry.
+  if (functionName === CODE_REVIEW_REQUEST_TOOL) {
+    return null;
+  }
+
   const currentUrl = window.location.href;
   const storage = getURLBasedStorage();
 
