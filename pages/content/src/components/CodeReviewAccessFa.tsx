@@ -94,6 +94,8 @@ export function CodeReviewAccessFa() {
         setRepo(pendingRequest.repo);
         setDuration(pendingRequest.durationMinutes);
         setConfirming(true);
+      } else {
+        setConfirming(false);
       }
     } catch (statusError) {
       setError(statusError instanceof Error ? statusError.message : 'دریافت وضعیت دسترسی ناموفق بود.');
@@ -181,6 +183,29 @@ export function CodeReviewAccessFa() {
       setConfirming(true);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'ثبت درخواست دسترسی ناموفق بود.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const rejectPending = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const response = await sendControlMessage<ControlResponse>({ type: 'code-review:reject' });
+      if (!response.success) {
+        throw new Error(response.error || 'رد درخواست دسترسی ناموفق بود.');
+      }
+
+      setConfirming(false);
+      window.dispatchEvent(new CustomEvent('code-review:pending-updated'));
+      emitSecurityToast({
+        title: 'درخواست دسترسی رد شد',
+        message: owner.trim() && repo.trim() ? `${owner.trim()}/${repo.trim()} از صف تأیید حذف شد.` : 'درخواست معلق از صف تأیید حذف شد.',
+        variant: 'info',
+      });
+    } catch (rejectError) {
+      setError(rejectError instanceof Error ? rejectError.message : 'رد درخواست دسترسی ناموفق بود.');
     } finally {
       setLoading(false);
     }
@@ -331,7 +356,7 @@ export function CodeReviewAccessFa() {
         <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/40">
           <div className="font-bold text-amber-900 dark:text-amber-200">تأیید نهایی دسترسی</div>
           <p className="mt-2 text-sm text-amber-900/80 dark:text-amber-200/80">
-            درخواست ثبت شد. قبل از فعال‌سازی، مشخصات زیر را بررسی کنید. بعد از پایان زمان، دسترسی خودکار منقضی می‌شود و تمدید نیاز به تأیید دوباره شما دارد.
+            یک درخواست معلق وجود دارد. این درخواست ممکن است از گفتگوی دیگری آمده باشد؛ می‌توانید همین‌جا آن را تأیید یا به‌صورت سراسری رد کنید.
           </p>
 
           <dl className="mt-4 space-y-2 text-sm">
@@ -360,9 +385,9 @@ export function CodeReviewAccessFa() {
             <button
               type="button"
               disabled={loading}
-              onClick={() => setConfirming(false)}
+              onClick={() => void rejectPending()}
               className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold dark:border-slate-600">
-              انصراف
+              {loading ? 'در حال رد...' : 'رد درخواست'}
             </button>
           </div>
         </div>
