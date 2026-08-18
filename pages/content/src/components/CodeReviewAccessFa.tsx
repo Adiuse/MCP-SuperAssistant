@@ -1,4 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { useCurrentAdapter } from '../hooks';
+import { useMcpCommunication } from '../hooks/useMcpCommunication';
+import { instructionsState } from './sidebar/Instructions/InstructionManager';
+import { emitSecurityToast } from './mcpPopover/securityToast';
 
 type DurationMinutes = 5 | 10 | 20;
 
@@ -44,7 +48,24 @@ async function refreshMcpTools(): Promise<void> {
   }
 }
 
+async function waitForRefreshedInstructions(timeoutMs = 3500): Promise<string> {
+  const startedAt = Date.now();
+  let latest = instructionsState.instructions || '';
+
+  while (Date.now() - startedAt < timeoutMs) {
+    latest = instructionsState.instructions || latest;
+    if (/###\s+(get_file_contents|search_code|get_repository_tree|list_commits)\b/.test(latest)) {
+      return latest;
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 100));
+  }
+
+  return latest;
+}
+
 export function CodeReviewAccessFa() {
+  const { insertText, submitForm, isReady: isAdapterReady } = useCurrentAdapter();
+  const { refreshTools } = useMcpCommunication();
   const [owner, setOwner] = useState('');
   const [repo, setRepo] = useState('');
   const [duration, setDuration] = useState<DurationMinutes>(10);
@@ -165,6 +186,47 @@ export function CodeReviewAccessFa() {
     }
   };
 
+  const resumeApprovedReview = async (approvedSession: CodeReviewSession) => {
+    try {
+      await refreshMcpTools();
+      await refreshTools(true);
+
+      const updatedInstructions = await waitForRefreshedInstructions();
+      if (!isAdapterReady || !updatedInstructions.trim()) {
+        emitSecurityToast({
+          title: 'دسترسی فعال شد، ادامه خودکار انجام نشد',
+          message: 'ابزارهای GitHub فعال هستند اما آداپتر چت برای ادامه خودکار آماده نبود.',
+          variant: 'warning',
+        });
+        return;
+      }
+
+      const continuation = `${updatedInstructions}\n\n[MCP Approval Result] Code Review access is now approved and active for ${approvedSession.owner}/${approvedSession.repo}. Continue the user's pending repository task now using the newly available read-only MCP tools. Do not request access again unless this session expires or is revoked.`;
+      const inserted = await insertText(continuation);
+      if (!inserted) {
+        throw new Error('درج پیام ادامه در چت ناموفق بود.');
+      }
+
+      const submitted = await submitForm();
+      if (!submitted) {
+        throw new Error('ارسال خودکار پیام ادامه ناموفق بود.');
+      }
+
+      emitSecurityToast({
+        title: 'بررسی کد ادامه پیدا کرد',
+        message: `${approvedSession.owner}/${approvedSession.repo} — ابزارهای Read-only به مدل اعلام شدند.`,
+        variant: 'success',
+      });
+    } catch (resumeError) {
+      emitSecurityToast({
+        title: 'ادامه خودکار Code Review ناموفق بود',
+        message: resumeError instanceof Error ? resumeError.message : String(resumeError),
+        variant: 'warning',
+        durationMs: 6500,
+      });
+    }
+  };
+
   const approve = async () => {
     if (!validateRepository()) return;
 
@@ -186,7 +248,7 @@ export function CodeReviewAccessFa() {
 
       setSession(response.session);
       setConfirming(false);
-      await refreshMcpTools();
+      await resumeApprovedReview(response.session);
     } catch (approvalError) {
       setError(approvalError instanceof Error ? approvalError.message : 'فعال‌سازی دسترسی ناموفق بود.');
     } finally {
