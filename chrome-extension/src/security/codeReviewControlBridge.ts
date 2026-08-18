@@ -4,10 +4,12 @@ import {
   createPendingCodeReviewRequest,
   getActiveCodeReviewSession,
   getCodeReviewAuditLog,
+  getCodeReviewPreferences,
   getPendingCodeReviewRequests,
   recordCodeReviewAuditEvent,
   rejectPendingCodeReviewRequest,
   revokeCodeReviewSession,
+  saveCodeReviewPreferences,
   startCodeReviewSession,
 } from './codeReviewGate.js';
 import {
@@ -24,6 +26,8 @@ const logger = createLogger('CodeReviewControlBridge');
 
 export const CODE_REVIEW_CONTROL_MESSAGES = {
   STATUS: 'code-review:get-status',
+  SETTINGS: 'code-review:get-settings',
+  SAVE_SETTINGS: 'code-review:save-settings',
   REQUEST: 'code-review:request',
   APPROVE: 'code-review:approve',
   REJECT: 'code-review:reject',
@@ -34,15 +38,12 @@ export const CODE_REVIEW_CONTROL_MESSAGES = {
 
 let bridgeRegistered = false;
 
-function readRequestPayload(message: any): { owner: string; repo: string; durationMinutes: number } {
+function readSettingsPayload(message: any): { owner: string; repo: string; durationMinutes: number } {
   const owner = typeof message.payload?.owner === 'string' ? message.payload.owner.trim() : '';
   const repo = typeof message.payload?.repo === 'string' ? message.payload.repo.trim() : '';
   const durationMinutes = Number(message.payload?.durationMinutes);
 
-  if (!owner || !repo) {
-    throw new Error('نام مالک و مخزن الزامی است.');
-  }
-
+  if (!owner || !repo) throw new Error('نام مالک و مخزن الزامی است.');
   if (!CODE_REVIEW_ALLOWED_DURATIONS.includes(durationMinutes as 5 | 10 | 20)) {
     throw new Error('مدت دسترسی باید ۵، ۱۰ یا ۲۰ دقیقه باشد.');
   }
@@ -106,35 +107,54 @@ export function registerCodeReviewControlBridge(): void {
     const run = async () => {
       switch (message.type) {
         case CODE_REVIEW_CONTROL_MESSAGES.STATUS: {
-          const [session, pendingRequests] = await Promise.all([
+          const [session, pendingRequests, settings] = await Promise.all([
             getActiveCodeReviewSession(),
             getPendingCodeReviewRequests(),
+            getCodeReviewPreferences(),
           ]);
           return {
             success: true,
             session,
+            settings,
             pendingRequests,
             pendingRequest: pendingRequests[0] || null,
           };
         }
 
+        case CODE_REVIEW_CONTROL_MESSAGES.SETTINGS: {
+          const settings = await getCodeReviewPreferences();
+          return { success: true, settings };
+        }
+
+        case CODE_REVIEW_CONTROL_MESSAGES.SAVE_SETTINGS: {
+          const input = readSettingsPayload(message);
+          const settings = await saveCodeReviewPreferences(input);
+          return { success: true, settings };
+        }
+
         case CODE_REVIEW_CONTROL_MESSAGES.REQUEST: {
-          const { owner, repo, durationMinutes } = readRequestPayload(message);
           const tabId = sender.tab?.id;
           if (tabId === undefined) throw new Error('درخواست دسترسی فقط از داخل تب مرورگر مجاز است.');
 
           const sourcePath = safeSourcePath(sender.tab?.url);
           const request = await createPendingCodeReviewRequest({
-            owner,
-            repo,
-            durationMinutes,
             sourceTabId: tabId,
             sourcePath,
-            sourceKey: sourcePath ? `${tabId}:${sourcePath}:${owner}/${repo}:${durationMinutes}` : undefined,
+            sourceKey: sourcePath ? `${tabId}:${sourcePath}` : `tab:${tabId}:${Date.now()}`,
           });
 
-          const sent = await notifyCodeReviewAccessRequested(owner, repo, durationMinutes);
-          await auditNotificationResult({ sent, owner, repo, tabId, reason: 'access_requested' });
+          const sent = await notifyCodeReviewAccessRequested(
+            request.owner,
+            request.repo,
+            request.durationMinutes,
+          );
+          await auditNotificationResult({
+            sent,
+            owner: request.owner,
+            repo: request.repo,
+            tabId,
+            reason: 'access_requested',
+          });
           return { success: true, pendingRequest: request };
         }
 
