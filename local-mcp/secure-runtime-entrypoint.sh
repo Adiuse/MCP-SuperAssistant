@@ -3,10 +3,10 @@ set -euo pipefail
 
 CONFIG_PATH="${MCP_SUPERASSISTANT_CONFIG:-/run/config/config.json}"
 GITHUB_ENV_PATH="${MCP_SUPERASSISTANT_GITHUB_ENV:-/run/secrets/github.env}"
-GATEWAY_HOST="${MCP_GATEWAY_HOST:-0.0.0.0}"
-GATEWAY_PORT="${MCP_GATEWAY_PORT:-38106}"
+PUBLIC_PORT="${MCP_GATEWAY_PUBLIC_PORT:-38106}"
+GATEWAY_INTERNAL_PORT="${MCP_GATEWAY_INTERNAL_PORT:-38108}"
 UPSTREAM_PORT="${MCP_UPSTREAM_PORT:-38107}"
-UPSTREAM_URL="${MCP_UPSTREAM_URL:-http://localhost:${UPSTREAM_PORT}/mcp}"
+UPSTREAM_URL="${MCP_UPSTREAM_URL:-http://127.0.0.1:${UPSTREAM_PORT}/mcp}"
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
   echo "MCP config not found inside secure runtime: $CONFIG_PATH" >&2
@@ -43,16 +43,23 @@ if ! command -v mcp-superassistant-proxy >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v socat >/dev/null 2>&1; then
+  echo "socat is not available inside secure runtime." >&2
+  exit 1
+fi
+
 cleanup() {
-  if [[ -n "${PROXY_PID:-}" ]]; then
-    kill "$PROXY_PID" 2>/dev/null || true
-    wait "$PROXY_PID" 2>/dev/null || true
-  fi
+  for pid in "${SOCAT_PID:-}" "${GATEWAY_PID:-}" "${PROXY_PID:-}"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
 }
 trap cleanup EXIT INT TERM
 
-echo "[secure-code-review] Starting PAT-bearing MCP proxy on container-loopback:${UPSTREAM_PORT}"
-echo "[secure-code-review] The upstream proxy port is NOT published to the host."
+echo "[secure-code-review] Starting PAT-bearing MCP proxy on container loopback 127.0.0.1:${UPSTREAM_PORT}"
+echo "[secure-code-review] The PAT-bearing proxy port is NOT published to the host."
 mcp-superassistant-proxy \
   --config "$CONFIG_PATH" \
   --outputTransport streamableHttp \
@@ -66,9 +73,30 @@ if ! kill -0 "$PROXY_PID" 2>/dev/null; then
   exit 1
 fi
 
-echo "[secure-code-review] Starting capability gateway on ${GATEWAY_HOST}:${GATEWAY_PORT}"
-MCP_GATEWAY_HOST="$GATEWAY_HOST" \
-MCP_GATEWAY_PORT="$GATEWAY_PORT" \
+echo "[secure-code-review] Starting capability gateway on container loopback 127.0.0.1:${GATEWAY_INTERNAL_PORT}"
+MCP_GATEWAY_HOST="127.0.0.1" \
+MCP_GATEWAY_PORT="$GATEWAY_INTERNAL_PORT" \
 MCP_UPSTREAM_URL="$UPSTREAM_URL" \
-MCP_GATEWAY_CONTAINERIZED=1 \
-  node /opt/mcp-superassistant/code-review-capability-gateway.mjs
+  node /opt/mcp-superassistant/code-review-capability-gateway.mjs &
+GATEWAY_PID=$!
+
+sleep 1
+if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+  echo "Capability gateway exited before the host front door could start." >&2
+  exit 1
+fi
+
+echo "[secure-code-review] Exposing only the capability-gated front door on container port ${PUBLIC_PORT}"
+socat \
+  "TCP-LISTEN:${PUBLIC_PORT},fork,reuseaddr,bind=0.0.0.0" \
+  "TCP:127.0.0.1:${GATEWAY_INTERNAL_PORT}" &
+SOCAT_PID=$!
+
+sleep 0.25
+if ! kill -0 "$SOCAT_PID" 2>/dev/null; then
+  echo "Secure front-door forwarder failed to start." >&2
+  exit 1
+fi
+
+echo "[secure-code-review] Secure runtime ready. Only the capability gateway is published."
+wait -n "$PROXY_PID" "$GATEWAY_PID" "$SOCAT_PID"
