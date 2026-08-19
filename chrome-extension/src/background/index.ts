@@ -32,7 +32,6 @@ import type {
   UpdateServerConfigRequest,
   HeartbeatRequest,
   ConnectionStatusChangedBroadcast,
-  ToolUpdateBroadcast,
   ServerConfigUpdatedBroadcast,
   HeartbeatResponseBroadcast
 } from '../../../pages/content/src/types/messages';
@@ -223,15 +222,10 @@ function categorizeToolError(error: Error): { isConnectionError: boolean; isTool
 
 /**
  * Initialize the extension
- * 
- * This function is called once when the extension starts and handles:
- * - Theme initialization
- * - Server URL loading from storage
- * - Initial connection status check and broadcast
- * - Asynchronous server connection attempt if needed
- * - Initial tools fetching and broadcast if connected
- * 
- * The initialization is designed to be non-blocking and resilient to failures.
+ *
+ * Connection status may be broadcast globally because it does not grant GitHub
+ * capability. Tool lists are never broadcast globally: every content tab must
+ * request its own gated tool set through mcp:get-tools.
  */
 async function initializeExtension() {
   sendAnalyticsEvent('extension_loaded', {});
@@ -281,27 +275,12 @@ async function initializeExtension() {
       isConnected = false;
     }
     
-    // Update and broadcast the actual connection status
+    // Update and broadcast the actual connection status. Content tabs refresh
+    // their own gated tool sets after receiving connected status.
     updateConnectionStatus(isConnected);
     broadcastConnectionStatusToContentScripts(isConnected);
     
     logger.debug(`Initial connection status broadcast: ${isConnected ? 'connected' : 'disconnected'}`);
-    
-    // If connected, also broadcast tools
-    if (isConnected) {
-      try {
-        logger.debug('[Background] Server connected, fetching and broadcasting initial tools...');
-        const primitives = await getPrimitivesWithBackwardsCompatibility(serverUrl, false, connectionType);
-        logger.debug(`Retrieved ${primitives.length} primitives for initial broadcast`);
-        
-        const tools = normalizeTools(primitives);
-        logger.debug(`Broadcasting ${tools.length} normalized initial tools`);
-        
-        broadcastToolsUpdateToContentScripts(tools);
-      } catch (error) {
-        logger.warn('[Background] Error broadcasting initial tools:', error);
-      }
-    }
   };
   
   // Run the initial connection attempt immediately
@@ -336,21 +315,6 @@ async function tryConnectToServer(uri: string, type: ConnectionType = connection
     logger.debug('MCP client connected successfully');
     updateConnectionStatus(true);
     broadcastConnectionStatusToContentScripts(true);
-    
-    // Also broadcast available tools after successful connection
-    try {
-      logger.debug('[Background] Connection successful, fetching and broadcasting tools...');
-      const primitives = await getPrimitivesWithBackwardsCompatibility(uri, true, type);
-      logger.debug(`Retrieved ${primitives.length} primitives after connection`);
-      
-      const tools = normalizeTools(primitives);
-      logger.debug(`Broadcasting ${tools.length} normalized tools after successful connection`);
-      
-      broadcastToolsUpdateToContentScripts(tools);
-    } catch (toolsError) {
-      logger.warn('[Background] Error broadcasting tools after connection:', toolsError);
-    }
-    
     connectionAttemptCount = 0; // Reset counter on success
   } catch (error: any) {
     const errorCategory = categorizeToolError(error instanceof Error ? error : new Error(String(error)));
@@ -399,26 +363,11 @@ setInterval(async () => {
   const isConnected = await checkMcpServerConnection();
   updateConnectionStatus(isConnected);
 
-  // Broadcast status change if it changed
+  // Broadcast status change if it changed. Never broadcast a shared tool list;
+  // each tab performs its own scoped refresh when it sees connected status.
   if (wasConnected !== isConnected) {
     logger.debug(`Connection status changed: ${wasConnected} -> ${isConnected}`);
     broadcastConnectionStatusToContentScripts(isConnected);
-    
-    // If connected, also broadcast available tools
-    if (isConnected) {
-      try {
-        logger.debug('[Background] Periodic check: Connection established, fetching and broadcasting tools...');
-        const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), true, connectionType);
-        logger.debug(`Periodic check: Retrieved ${primitives.length} primitives`);
-        
-        const tools = normalizeTools(primitives);
-        logger.debug(`Periodic check: Broadcasting ${tools.length} normalized tools`);
-        
-        broadcastToolsUpdateToContentScripts(tools);
-      } catch (error) {
-        logger.warn('[Background] Error broadcasting tools after status change:', error);
-      }
-    }
   } else {
     // Even if status didn't change, periodically broadcast to ensure content scripts are in sync
     broadcastConnectionStatusToContentScripts(isConnected);
@@ -672,6 +621,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 /**
+ * Fetch the tool list for exactly one trusted content-script sender.
+ *
+ * There is intentionally no fallback to another tab or to a global session.
+ * The Code Review gate receives the real sender tab id and URL and decides
+ * whether this origin sees only request_code_review_access or the read allowlist.
+ */
+async function getToolsForSender(
+  sender: chrome.runtime.MessageSender,
+  forceRefresh: boolean,
+): Promise<any[]> {
+  const tabId = sender.tab?.id;
+  if (tabId === undefined) {
+    throw new Error('MCP tool discovery requires a trusted browser-tab origin');
+  }
+
+  const primitives = await getPrimitivesWithBackwardsCompatibility(
+    getServerUrl(),
+    forceRefresh,
+    connectionType,
+    tabId,
+    sender.tab?.url,
+  );
+  return normalizeTools(primitives);
+}
+
+/**
  * Enhanced MCP message handler with proper error handling, type safety, and response formatting
  * 
  * @param message - The message received from the content script
@@ -699,8 +674,21 @@ async function handleMcpMessage(
           throw new Error('Tool name is required');
         }
 
-        logger.debug(`Calling tool: ${toolName} from adapter: ${adapterName || 'unknown'}`);
-        result = await callToolWithBackwardsCompatibility(getServerUrl(), toolName, args || {}, adapterName);
+        const callerTabId = sender.tab?.id;
+        if (callerTabId === undefined) {
+          throw new Error('MCP tool execution requires a trusted browser-tab origin');
+        }
+
+        logger.debug(`Calling tool: ${toolName} from adapter: ${adapterName || 'unknown'} in tab ${callerTabId}`);
+        result = await callToolWithBackwardsCompatibility(
+          getServerUrl(),
+          toolName,
+          args || {},
+          adapterName,
+          connectionType,
+          callerTabId,
+          sender.tab?.url,
+        );
         logger.debug(`Tool call completed: ${toolName}`);
         break;
       }
@@ -731,20 +719,16 @@ async function handleMcpMessage(
 
       case 'mcp:get-tools': {
         const { forceRefresh = false } = payload as GetToolsRequest;
-        logger.debug(`Getting tools (forceRefresh: ${forceRefresh})`);
+        logger.debug(`Getting origin-scoped tools for tab ${sender.tab?.id ?? 'unknown'} (forceRefresh: ${forceRefresh})`);
         
         try {
-          const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), forceRefresh, connectionType);
-          logger.debug(`Retrieved ${primitives.length} primitives from server`);
-          
-          // Use the helper function to normalize tools with proper schema handling
-          const tools = normalizeTools(primitives);
-          logger.debug(`Returning ${tools.length} normalized tools to content script`);
-          
+          const tools = await getToolsForSender(sender, forceRefresh);
+          logger.debug(`Returning ${tools.length} gated tools to tab ${sender.tab?.id}`);
           result = tools;
         } catch (error) {
-          logger.error('[Background] Error getting tools:', error);
-          // Return empty array instead of throwing to prevent UI crashes
+          logger.error('[Background] Error getting origin-scoped tools:', error);
+          // Return empty array instead of throwing to prevent UI crashes. The Gate
+          // remains authoritative and no broader/global tool set is substituted.
           result = [];
         }
         break;
@@ -776,24 +760,9 @@ async function handleMcpMessage(
           const isConnected = await checkMcpServerConnection();
           updateConnectionStatus(isConnected);
           
-          // Broadcast the new status to all content scripts
+          // Broadcast only connection state. Each content tab refreshes its own
+          // gated tool set through mcp:get-tools.
           broadcastConnectionStatusToContentScripts(isConnected);
-          
-          // If connected, also refresh and broadcast tools
-          if (isConnected) {
-            try {
-              logger.debug('[Background] Fetching tools after successful reconnection...');
-              const primitives = await getPrimitivesWithBackwardsCompatibility(getServerUrl(), true, connectionType);
-              logger.debug(`Retrieved ${primitives.length} primitives after reconnection`);
-              
-              const tools = normalizeTools(primitives);
-              logger.debug(`Broadcasting ${tools.length} normalized tools after reconnection`);
-              
-              broadcastToolsUpdateToContentScripts(tools);
-            } catch (toolsError) {
-              logger.error('[Background] Error fetching tools after reconnect:', toolsError);
-            }
-          }
           
           result = { isConnected, message: 'Reconnection completed' };
         } catch (error) {
@@ -860,18 +829,8 @@ async function handleMcpMessage(
             updateConnectionStatus(isConnected);
             broadcastConnectionStatusToContentScripts(isConnected);
             logger.debug(`Async reconnection completed, connected: ${isConnected}`);
-            
-            // If connected, fetch and broadcast tools
-            if (isConnected) {
-              try {
-                const primitives = await getPrimitivesWithBackwardsCompatibility(config.uri, true, newType);
-                const tools = normalizeTools(primitives);
-                broadcastToolsUpdateToContentScripts(tools);
-                logger.debug(`Broadcasted ${tools.length} normalized tools after config update`);
-              } catch (toolError) {
-                logger.warn('[Background] Failed to fetch tools after config update:', toolError);
-              }
-            }
+            // No tool broadcast here. Every tab must perform a fresh origin-scoped
+            // mcp:get-tools call against the new connection.
           } catch (error) {
             logger.warn('[Background] Async reconnect after config update failed:', error);
             const isConnected = await checkMcpServerConnection();
@@ -963,8 +922,9 @@ async function handleMcpMessage(
 }
 
 /**
- * Broadcast connection status to all content scripts via context bridge
- * 
+ * Broadcast connection status to all content scripts via context bridge.
+ * Connection health is global and carries no GitHub capability.
+ *
  * @param isConnected - Whether the MCP server is connected
  * @param error - Optional error message if connection failed
  */
@@ -980,34 +940,6 @@ function broadcastConnectionStatusToContentScripts(isConnected: boolean, error?:
       error: error || undefined,
       isConnected,
       timestamp: Date.now()
-    },
-    origin: 'background',
-    timestamp: Date.now()
-  };
-  
-  chrome.tabs.query({}, (tabs) => {
-    tabs.forEach(tab => {
-      if (tab.id) {
-        chrome.tabs.sendMessage(tab.id, broadcastMessage).catch(() => {
-          // Ignore errors for tabs that can't receive messages
-        });
-      }
-    });
-  });
-}
-
-/**
- * Broadcast tools update to all content scripts via context bridge
- * 
- * @param tools - Array of available MCP tools
- */
-function broadcastToolsUpdateToContentScripts(tools: any[]) {
-  logger.debug(`Broadcasting tools update to content scripts: ${tools.length} tools`);
-  
-  const broadcastMessage: BaseMessage & { payload: ToolUpdateBroadcast } = {
-    type: 'mcp:tool-update',
-    payload: {
-      tools
     },
     origin: 'background',
     timestamp: Date.now()
@@ -1179,4 +1111,3 @@ async function initializeRemoteConfig(): Promise<void> {
     // Don't throw - let the extension continue without remote config
   }
 }
-
