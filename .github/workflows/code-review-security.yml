@@ -30,3 +30,5 @@ jobs:
         run: pnpm exec node tests/code-review-flow.mjs
       - name: Run Code Review DOM request contract
         run: pnpm exec node tests/code-review-dom-request-contract.mjs
+      - name: Run namespaced GitHub tool alias contract
+        run: pnpm exec node tests/code-review-tool-alias.mjs
