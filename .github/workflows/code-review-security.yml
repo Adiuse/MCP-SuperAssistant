@@ -29,6 +29,8 @@ jobs:
         run: pnpm --filter chrome-extension type-check
       - name: Run prompt-bound Code Review security flow
         run: pnpm exec node tests/code-review-flow.mjs
+      - name: Run proxy capability gateway contract
+        run: pnpm exec node tests/code-review-capability-gateway.mjs
       - name: Run Code Review DOM request contract
         run: pnpm exec node tests/code-review-dom-request-contract.mjs
       - name: Run namespaced GitHub tool alias contract
