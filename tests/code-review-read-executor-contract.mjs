@@ -15,21 +15,33 @@ const entry = path.join(
 const source = await fs.readFile(entry, 'utf8');
 
 assert.match(source, /response\.originSession/);
-assert.match(source, /type:\s*MCP_CALL_MESSAGE/);
-assert.match(source, /toolName:\s*call\.toolName/);
-assert.match(source, /<function_result call_id=/);
-assert.match(source, /await adapter\.insertText\(wrapper\)/);
+assert.match(
+  source,
+  /querySelector<HTMLButtonElement>\('\.execute-button'\)/,
+  'approved reads must trigger the renderer native Run button',
+);
+assert.match(source, /executeButton\.click\(\)/);
+assert.match(
+  source,
+  /querySelector<HTMLButtonElement>\('\.insert-result-button'\)/,
+  'approved read results must use the renderer native Insert button when Auto Insert is off',
+);
+assert.match(source, /insertButton\.click\(\)/);
 assert.match(source, /await adapter\.submitForm\(\)/);
-assert.match(source, /if \(disposed \|\| generalAutoExecuteEnabled\(\)\) return;/);
 assert.match(
   source,
   /querySelectorAll<HTMLElement>\('\.function-block \.xml-results-panel pre'\)/,
-  'approved reads must be detected from the renderer raw-info panel inside the real function card',
+  'the security bridge may identify calls only from renderer-owned raw-info panels',
 );
 assert.doesNotMatch(
   source,
-  /source\.closest\('\.function-block'\)\) return/,
-  'the executor must not skip the rendered function card that contains the real model read call',
+  /MCP_CALL_MESSAGE|type:\s*['"]mcp:call-tool['"]|toolName:\s*call\.toolName/,
+  'approved reads must not directly call MCP from the security bridge',
+);
+assert.doesNotMatch(
+  source,
+  /<function_result call_id=|insertText\(wrapper\)|resultToText/,
+  'the security bridge must not build or inject tool results itself',
 );
 assert.doesNotMatch(source, /request_code_review_access/);
 
@@ -53,13 +65,41 @@ globalThis.window = {
 const mod = await import(`${pathToFileURL(outfile).href}?t=${Date.now()}`);
 const utils = mod.codeReviewReadExecutorTestUtils;
 
-window.__mcpAutomationState = { autoExecute: false };
+window.__mcpAutomationState = { autoExecute: false, autoInsert: false, autoSubmit: false };
 assert.equal(utils.generalAutoExecuteEnabled(), false);
-window.__mcpAutomationState = { autoExecute: true };
+assert.deepEqual(utils.getAutomationState(), {
+  autoExecute: false,
+  autoInsert: false,
+  autoSubmit: false,
+  autoInsertDelay: 0,
+  autoSubmitDelay: 0,
+});
+
+window.__mcpAutomationState = {
+  autoExecute: true,
+  autoInsert: true,
+  autoSubmit: true,
+  autoInsertDelay: 2,
+  autoSubmitDelay: 3,
+};
 assert.equal(utils.generalAutoExecuteEnabled(), true);
+assert.deepEqual(utils.getAutomationState(), {
+  autoExecute: true,
+  autoInsert: true,
+  autoSubmit: true,
+  autoInsertDelay: 2,
+  autoSubmitDelay: 3,
+});
+
 window.__mcpAutomationState = undefined;
-window.toggleState = { autoExecute: false };
-assert.equal(utils.generalAutoExecuteEnabled(), false);
+window.toggleState = { autoExecute: false, autoInsert: true, autoSubmit: false };
+assert.deepEqual(utils.getAutomationState(), {
+  autoExecute: false,
+  autoInsert: true,
+  autoSubmit: false,
+  autoInsertDelay: 0,
+  autoSubmitDelay: 0,
+});
 window.toggleState = undefined;
 assert.equal(
   utils.generalAutoExecuteEnabled(),
@@ -102,9 +142,4 @@ assert.equal(
   null,
 );
 
-assert.equal(
-  utils.resultToText({ content: [{ type: 'text', text: '# README' }] }),
-  '# README',
-);
-
-console.log('✓ Approved Code Review reads execute from rendered function cards through the origin-scoped Gate pipeline');
+console.log('✓ Approved Code Review reads reuse the upstream Run/Insert pipeline and only add origin-scoped policy');
