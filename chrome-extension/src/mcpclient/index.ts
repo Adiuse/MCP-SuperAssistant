@@ -134,6 +134,17 @@ function safeSourcePath(url?: string): string | undefined {
   }
 }
 
+function summarizeRawToolNames(tools: Array<{ name?: string }>): string {
+  const names = tools
+    .map(tool => String(tool?.name || '').trim())
+    .filter(Boolean)
+    .slice(0, 24);
+
+  if (names.length === 0) return '(none)';
+  const suffix = tools.length > names.length ? ` … +${tools.length - names.length} more` : '';
+  return `${names.join(', ')}${suffix}`;
+}
+
 async function executeGatedToolCall(
   client: McpClient,
   toolName: string,
@@ -205,9 +216,9 @@ async function executeGatedToolCall(
     effectiveSourceUrl,
   );
 
-  // MCP SuperAssistant Proxy namespaces tools when aggregating servers (for
-  // example `github.get_file_contents`). Resolve the canonical approved alias
-  // back to the exact server tool only after the Gate has authorized the call.
+  // MCP SuperAssistant Proxy may namespace tools when aggregating servers.
+  // Resolve the canonical approved alias back to the exact server tool only
+  // after the Gate has authorized the call.
   const primitives = await client.getPrimitives(false);
   const serverToolName = resolveScopedServerToolName(
     primitives.tools,
@@ -245,10 +256,21 @@ async function getGatedPrimitives(
   const tools = aliasScopedTools(response.tools, CODE_REVIEW_ALLOWED_TOOLS);
 
   if (tools.length === 0) {
-    logger.warn(
-      `[CodeReview] Active session ${session.id} found, but MCP server exposed no unambiguous approved GitHub read tools`,
-    );
+    const rawNames = summarizeRawToolNames(response.tools);
+    const reason =
+      response.tools.length === 0
+        ? 'MCP server returned zero tools after Code Review approval. Ensure the configured github-review MCP server is running and exposed through the proxy.'
+        : `MCP server returned ${response.tools.length} raw tool(s), but none matched the approved GitHub read-only aliases. Raw names: ${rawNames}`;
+
+    logger.warn(`[CodeReview] ${reason}`);
+    throw new Error(reason);
   }
+
+  logger.debug(
+    `[CodeReview] Exposing ${tools.length} approved GitHub read tool(s) for origin tab ${callerTabId}: ${tools
+      .map(tool => tool.name)
+      .join(', ')}`,
+  );
 
   // The model sees only canonical allowlisted names even when the proxy uses a
   // server namespace. No write/unapproved tool descriptor crosses this boundary.
