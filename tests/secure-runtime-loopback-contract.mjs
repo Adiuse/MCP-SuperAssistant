@@ -5,8 +5,11 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, '..');
-const entrypoint = await fs.readFile(path.join(repoRoot, 'local-mcp', 'secure-runtime-entrypoint.sh'), 'utf8');
-const ssot = await fs.readFile(path.join(repoRoot, 'docs', 'SSOT_PROMPT_BOUND_GITHUB_ACCESS_GATEWAY.md'), 'utf8');
+const [entrypoint, gatewaySource, ssot] = await Promise.all([
+  fs.readFile(path.join(repoRoot, 'local-mcp', 'secure-runtime-entrypoint.sh'), 'utf8'),
+  fs.readFile(path.join(repoRoot, 'local-mcp', 'code-review-capability-gateway.mjs'), 'utf8'),
+  fs.readFile(path.join(repoRoot, 'docs', 'SSOT_PROMPT_BOUND_GITHUB_ACCESS_GATEWAY.md'), 'utf8'),
+]);
 
 assert.match(
   entrypoint,
@@ -29,9 +32,24 @@ assert.doesNotMatch(
   'secure runtime must not use ambiguous localhost for the PAT-bearing upstream path',
 );
 assert.match(
+  gatewaySource,
+  /DEFAULT_HOST = process\.env\.MCP_GATEWAY_HOST \|\| '127\.0\.0\.1'/,
+  'standalone capability gateway must also default to explicit IPv4 loopback',
+);
+assert.match(
+  gatewaySource,
+  /DEFAULT_UPSTREAM = process\.env\.MCP_UPSTREAM_URL \|\| 'http:\/\/127\.0\.0\.1:38107\/mcp'/,
+  'standalone capability gateway must not default its PAT-bearing upstream to localhost',
+);
+assert.doesNotMatch(
+  gatewaySource,
+  /http:\/\/localhost:38107\/mcp/,
+  'gateway source must not retain the ambiguous localhost upstream default',
+);
+assert.match(
   ssot,
   /Endpoint رسمی و Canonical روی Host:[\s\S]*http:\/\/127\.0\.0\.1:38106\/mcp/,
   'SSOT must retain the explicit host front-door endpoint',
 );
 
-console.log('✓ Secure runtime binds both the host front door and internal PAT-bearing MCP proxy to explicit IPv4 loopback');
+console.log('✓ Secure runtime binds host front door, gateway and PAT-bearing MCP proxy to explicit IPv4 loopback');
