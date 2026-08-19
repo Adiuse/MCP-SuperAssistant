@@ -168,12 +168,33 @@ assert.match(
   /TCP-LISTEN:\$\{PUBLIC_PORT\}.*TCP:127\.0\.0\.1:\$\{GATEWAY_INTERNAL_PORT\}/s,
   'the published port must forward only to the loopback capability gateway, never to the PAT proxy',
 );
+assert.doesNotMatch(
+  dockerfile,
+  /apt-get install[^\n]*docker\.io/,
+  'secure runtime must not install Debian docker.io because its client API can be older than the host daemon minimum',
+);
 assert.match(
   dockerfile,
-  /docker\.io socat/,
-  'secure runtime image must include only the runtime dependencies needed for isolated proxy execution and loopback forwarding',
+  /ARG DOCKER_CLI_VERSION=27\.5\.1/,
+  'secure runtime Docker CLI must be pinned to a modern API-compatible release',
+);
+assert.match(
+  dockerfile,
+  /download\.docker\.com\/linux\/static\/stable\/\$\{docker_arch\}\/docker-\$\{DOCKER_CLI_VERSION\}\.tgz/,
+  'secure runtime must install the pinned Docker CLI from Docker static releases rather than distro docker.io',
+);
+assert.match(
+  dockerfile,
+  /amd64\) docker_arch='x86_64'[\s\S]*arm64\) docker_arch='aarch64'/,
+  'secure runtime Docker CLI download must map supported BuildKit architectures explicitly',
+);
+assert.match(
+  dockerfile,
+  /docker --version/,
+  'secure runtime image build must verify that the modern Docker CLI is installed',
 );
 
 console.log('✓ Capability gateway requires an extension credential + active prompt-bound lease and re-enforces read-only repo scope');
 console.log('✓ PAT-bearing MCP proxy has no host-published port; host traffic can reach only the capability-gated front door');
 console.log('✓ MCP config and GitHub credential are streamed into container tmpfs without host bind-mount permission weakening');
+console.log('✓ Secure runtime pins a modern Docker CLI instead of Debian docker.io to avoid host-daemon API incompatibility');
