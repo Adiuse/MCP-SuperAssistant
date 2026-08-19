@@ -21,6 +21,16 @@ assert.match(source, /<function_result call_id=/);
 assert.match(source, /await adapter\.insertText\(wrapper\)/);
 assert.match(source, /await adapter\.submitForm\(\)/);
 assert.match(source, /if \(disposed \|\| generalAutoExecuteEnabled\(\)\) return;/);
+assert.match(
+  source,
+  /querySelectorAll<HTMLElement>\('\.function-block \.xml-results-panel pre'\)/,
+  'approved reads must be detected from the renderer raw-info panel inside the real function card',
+);
+assert.doesNotMatch(
+  source,
+  /source\.closest\('\.function-block'\)\) return/,
+  'the executor must not skip the rendered function card that contains the real model read call',
+);
 assert.doesNotMatch(source, /request_code_review_access/);
 
 const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-read-executor-test-'));
@@ -37,7 +47,7 @@ await build({
 });
 
 globalThis.window = {
-  location: { pathname: '/c/test', search: '' },
+  location: { pathname: '/c/test', search: '?model=gpt-5' },
 };
 
 const mod = await import(`${pathToFileURL(outfile).href}?t=${Date.now()}`);
@@ -51,7 +61,11 @@ window.__mcpAutomationState = undefined;
 window.toggleState = { autoExecute: false };
 assert.equal(utils.generalAutoExecuteEnabled(), false);
 window.toggleState = undefined;
-assert.equal(utils.generalAutoExecuteEnabled(), true);
+assert.equal(
+  utils.generalAutoExecuteEnabled(),
+  false,
+  'missing automation state must mirror the renderer effective default: Auto Execute OFF',
+);
 
 const readCall = [
   '{"type":"function_call_start","name":"get_file_contents","call_id":7}',
@@ -93,4 +107,4 @@ assert.equal(
   '# README',
 );
 
-console.log('✓ Approved Code Review reads bypass Auto Execute only through the origin-scoped Gate pipeline');
+console.log('✓ Approved Code Review reads execute from rendered function cards through the origin-scoped Gate pipeline');
