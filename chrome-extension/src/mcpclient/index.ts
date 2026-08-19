@@ -17,7 +17,7 @@ import {
   createPendingCodeReviewRequest,
   enforceCodeReviewResultPolicy,
   filterCodeReviewTools,
-  getActiveCodeReviewSession,
+  getActiveCodeReviewSessionForOrigin,
   getCodeReviewRequestTool,
   getPendingCodeReviewRequests,
   recordCodeReviewAuditEvent,
@@ -159,7 +159,7 @@ async function executeGatedToolCall(
             : `tab:${effectiveCallerTabId}`,
     });
 
-    const wasAlreadyPending = pendingBefore.some(item => item.id === request.id);
+    const wasAlreadyPending = pendingBefore.some(item => item.requestId === request.requestId);
     if (!wasAlreadyPending) {
       const sent = await notifyCodeReviewAccessRequested(
         request.owner,
@@ -184,7 +184,7 @@ async function executeGatedToolCall(
         },
       ],
       pendingApproval: true,
-      requestId: request.id,
+      requestId: request.requestId,
       owner: request.owner,
       repo: request.repo,
       durationMinutes: request.durationMinutes,
@@ -194,36 +194,40 @@ async function executeGatedToolCall(
   // There is deliberately no "use the approved tab as the caller" fallback.
   // A real tab id must be supplied directly or recovered from the trusted
   // runtime-message capture above, otherwise the gate denies the operation.
-  const sanitizedArgs = await authorizeCodeReviewToolCall(
+  const authorization = await authorizeCodeReviewToolCall(
     toolName,
     args || {},
     effectiveCallerTabId,
+    effectiveSourceUrl,
   );
-  const result = await client.callTool(toolName, sanitizedArgs, adapterName);
-  return await enforceCodeReviewResultPolicy(toolName, result);
+  const result = await client.callTool(toolName, authorization.args, adapterName);
+  return await enforceCodeReviewResultPolicy(
+    toolName,
+    result,
+    authorization.sessionId,
+    effectiveCallerTabId,
+    effectiveSourceUrl,
+  );
 }
 
 async function getGatedPrimitives(
   client: McpClient,
   forceRefresh: boolean,
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any[]> {
-  const session = await getActiveCodeReviewSession();
+  // Never expose an operational tool set to an unscoped/background caller.
+  // Tool discovery for a chat must always carry the trusted sender tab/url.
+  if (callerTabId === undefined) return [];
+
+  const session = await getActiveCodeReviewSessionForOrigin(callerTabId, callerSourceUrl);
 
   if (!session) {
     return [{ type: 'tool', value: await getCodeReviewRequestTool() }];
   }
 
-  // New callers can request a tab-scoped list. Legacy background broadcasts do
-  // not carry a tab id yet, so they receive the allowlisted read set; the
-  // content-side security synchronizer hides that set from every non-origin tab.
-  // Execution itself remains strictly tab-gated above.
-  if (callerTabId !== undefined && callerTabId !== session.approvedTabId) {
-    return [];
-  }
-
   const response = await client.getPrimitives(forceRefresh);
-  const tools = await filterCodeReviewTools(response.tools);
+  const tools = await filterCodeReviewTools(response.tools, callerTabId, callerSourceUrl);
   return tools.map(tool => ({ type: 'tool', value: tool }));
 }
 
@@ -270,12 +274,13 @@ export async function getPrimitivesWithBackwardsCompatibility(
   forceRefresh: boolean = false,
   transportType?: import('./types/plugin.js').TransportType,
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any[]> {
   const client = await getGlobalClient();
   const type = transportType || detectTransportType(uri);
 
   if (!client.isConnected()) await client.connect({ uri, type });
-  return await getGatedPrimitives(client, forceRefresh, callerTabId);
+  return await getGatedPrimitives(client, forceRefresh, callerTabId, callerSourceUrl);
 }
 
 export async function forceReconnectToMcpServer(
@@ -359,10 +364,11 @@ export async function getPrimitivesWithWebSocket(
   uri: string,
   forceRefresh: boolean = false,
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any[]> {
   const client = await getGlobalClient();
   await client.connect({ uri, type: 'websocket' });
-  return await getGatedPrimitives(client, forceRefresh, callerTabId);
+  return await getGatedPrimitives(client, forceRefresh, callerTabId, callerSourceUrl);
 }
 
 export function normalizeToolsFromPrimitives(primitives: any[]): any[] {
