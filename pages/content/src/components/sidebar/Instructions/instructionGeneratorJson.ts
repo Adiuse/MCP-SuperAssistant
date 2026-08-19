@@ -73,14 +73,19 @@ function isActiveCodeReviewToolset(tools: InstructionTool[]): boolean {
 function generateActiveCodeReviewInstructions(toolList: string): string {
   return `[MCP Code Review Session Active][IMPORTANT]
 
-The user's explicit Code Review approval is active. Continue the repository task that was pending before approval using only the read-only MCP tools below. Do not request access again while this session remains active.
+The user's explicit Code Review approval is active ONLY for the real user prompt that created this review job. Continue that already-pending repository task using only the read-only MCP tools below.
 
-Rules:
-1. When a tool is needed, emit exactly ONE function call and then STOP.
-2. Do NOT use ChatGPT connectors, browsing, Python, or invented tools as a substitute for these MCP tools.
-3. Never invent tool names or parameter values. The repository scope is enforced by the extension.
-4. After a function call, wait for the extension-provided \`<function_result>\` before continuing.
-5. Never fabricate a function result.
+Prompt-bound lease rules:
+1. Internal extension messages such as \`<function_result>\` continue the SAME approved job. You may keep using the read-only tools while completing that original prompt, subject to expiry/revoke.
+2. If you receive a NEW ordinary user prompt/message after this approval, the previous lease MUST be treated as invalid for that new task even if its wall-clock timer would otherwise remain. Do NOT use these read tools for the new prompt. If the new prompt needs GitHub/repository data, call \`request_code_review_access\` after the extension re-exposes that request tool and wait for fresh approval.
+3. Never interpret a new user request as a continuation merely because it mentions the same repository or arrives before expiry.
+
+Tool-call rules for the currently approved prompt:
+4. When a tool is needed, emit exactly ONE function call and then STOP.
+5. Do NOT use ChatGPT connectors, browsing, Python, or invented tools as a substitute for these MCP tools.
+6. Never invent tool names or parameter values. The repository scope is enforced by the extension and secure gateway.
+7. After a function call, wait for the extension-provided \`<function_result>\` before continuing.
+8. Never fabricate a function result.
 
 Required JSONL call format:
 \`\`\`text
@@ -95,7 +100,7 @@ The template is intentionally not valid JSON until placeholders are replaced. Us
 
 ${toolList}
 
-Continue the user's already-pending repository task now. The extension will execute valid calls and return the actual result to this conversation.`;
+Continue the user's already-pending repository task now. The extension will execute valid calls and return the actual result to this conversation. A later ordinary user prompt requires a new approval before any new GitHub read.`;
 }
 
 /**
