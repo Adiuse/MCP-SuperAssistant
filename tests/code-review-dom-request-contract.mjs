@@ -56,6 +56,32 @@ assert.match(
 );
 
 assert.match(
+  headless,
+  /function currentConversationPath\(\): string \{\s*return window\.location\.pathname;\s*\}/,
+  'conversation identity in HeadlessInstructionSync must be pathname-only so query/hash changes do not fork an approved origin',
+);
+assert.doesNotMatch(
+  headless,
+  /window\.location\.pathname\}\$\{window\.location\.search/,
+  'HeadlessInstructionSync must not include the query string in conversation identity',
+);
+assert.match(
+  headless,
+  /This lease is bound to the real user prompt that created this review job\./,
+  'approval continuation must tell the model that the lease is prompt-bound',
+);
+assert.match(
+  headless,
+  /any later ordinary user prompt requires fresh approval before further GitHub reads\./,
+  'approval continuation must require fresh approval for a later real user prompt',
+);
+assert.doesNotMatch(
+  headless,
+  /Do not request access again unless this session expires or is revoked/,
+  'legacy session-scoped continuation wording must not survive the prompt-bound SSOT',
+);
+
+assert.match(
   instructions,
   /template below is intentionally NOT valid JSON/,
   'the instruction example must stay non-executable so inserting MCP instructions alone cannot create access requests',
@@ -73,11 +99,22 @@ assert.match(
 );
 assert.match(
   instructions,
+  /If you receive a NEW ordinary user prompt\/message after this approval/,
+  'active instructions must explicitly separate a new real user prompt from internal tool-result continuation',
+);
+assert.match(
+  instructions,
+  /A later ordinary user prompt requires a new approval before any new GitHub read\./,
+  'active instructions must preserve the prompt-bound approval rule through the whole tool loop',
+);
+assert.match(
+  instructions,
   /if \(isActiveCodeReviewToolset\(tools\)\) \{[\s\S]{0,120}?return generateActiveCodeReviewInstructions\(toolList\);/,
   'the compact continuation must be selected automatically after approval exposes the read-only tool set',
 );
 
 console.log('✓ Real DOM request call creates Pending independently of general Auto Execute');
 console.log('✓ Origin session, not global visibility, controls the per-tab tool set');
+console.log('✓ Headless conversation identity is pathname-only and approval continuation is prompt-bound');
 console.log('✓ Instruction template remains intentionally non-executable');
-console.log('✓ Approved Code Review resumes with a compact tool delta instead of duplicating the full initial instructions');
+console.log('✓ Approved Code Review resumes with a compact prompt-bound tool delta instead of duplicating the full initial instructions');
