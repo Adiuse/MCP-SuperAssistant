@@ -17,7 +17,10 @@ const READ_TOOL_NAMES = new Set([
 ]);
 
 const MAX_EXECUTION_ATTEMPTS = 3;
+const MAX_RESULT_SUBMIT_ATTEMPTS = 3;
 const GITHUB_DEVICE_LOGIN_URL = 'https://github.com/login/device';
+const CHAT_INPUT_SELECTOR =
+  '#prompt-textarea, .ProseMirror[contenteditable="true"], div[contenteditable="true"][data-id*="prompt"]';
 
 type ParsedReadCall = {
   toolName: string;
@@ -44,6 +47,11 @@ type GitHubDeviceAuthChallenge = {
   userCode?: string;
 };
 
+type CachedReadResult = {
+  key: string;
+  result: unknown;
+};
+
 declare global {
   interface Window {
     __mcpCodeReviewReadExecutorInstalled?: boolean;
@@ -67,6 +75,7 @@ const completedCalls = new Set<string>();
 const inFlightCalls = new Set<string>();
 const attemptsBySource = new WeakMap<HTMLElement, number>();
 const retryAfterBySource = new WeakMap<HTMLElement, number>();
+const resultBySource = new WeakMap<HTMLElement, CachedReadResult>();
 let observer: MutationObserver | null = null;
 let scanScheduled = false;
 let disposed = false;
@@ -165,10 +174,24 @@ function resultToText(result: unknown): string {
   if (result && typeof result === 'object') {
     const content = (result as any).content;
     if (Array.isArray(content)) {
-      const textParts = content
-        .filter(item => item?.type === 'text' && typeof item?.text === 'string')
-        .map(item => item.text);
-      if (textParts.length > 0) return textParts.join('\n');
+      const textParts: string[] = [];
+
+      for (const item of content) {
+        if (item?.type === 'text' && typeof item?.text === 'string') {
+          textParts.push(item.text);
+          continue;
+        }
+
+        // GitHub MCP get_file_contents returns the actual file body as an
+        // embedded MCP resource. The accompanying text item contains only a
+        // success/SHA message, so dropping resource.text makes the model believe
+        // it read the file while receiving none of its contents.
+        if (item?.type === 'resource' && typeof item?.resource?.text === 'string') {
+          textParts.push(item.resource.text);
+        }
+      }
+
+      if (textParts.length > 0) return textParts.join('\n\n');
     }
 
     try {
@@ -222,6 +245,43 @@ async function executeThroughSharedMcpClient(call: ParsedReadCall): Promise<unkn
   return await mcpClient.callTool(call.toolName, call.args);
 }
 
+function currentComposerText(): string {
+  const input = document.querySelector<HTMLElement>(CHAT_INPUT_SELECTOR);
+  return input?.textContent || '';
+}
+
+function composerContainsResult(callId: string): boolean {
+  return currentComposerText().includes(`<function_result call_id="${callId}">`);
+}
+
+async function wait(ms: number): Promise<void> {
+  await new Promise(resolve => window.setTimeout(resolve, ms));
+}
+
+async function submitInsertedResult(adapter: any, callId: string): Promise<void> {
+  // Let ChatGPT/other adapters observe the synthetic input event before the
+  // send click. A submitForm() true return only means a button was clicked, not
+  // that the host actually accepted and cleared the composer.
+  await wait(180);
+
+  for (let attempt = 1; attempt <= MAX_RESULT_SUBMIT_ATTEMPTS; attempt += 1) {
+    const submitted = await adapter.submitForm();
+    if (submitted) {
+      await wait(450);
+      if (!composerContainsResult(callId)) return;
+    }
+
+    if (attempt < MAX_RESULT_SUBMIT_ATTEMPTS) {
+      const input = document.querySelector<HTMLElement>(CHAT_INPUT_SELECTOR);
+      input?.focus();
+      input?.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(180 * attempt);
+    }
+  }
+
+  throw new Error('نتیجه GitHub داخل کادر پیام ماند و ارسال آن به مدل تأیید نشد.');
+}
+
 async function returnResultToConversation(call: ParsedReadCall, result: unknown): Promise<void> {
   if (!(await getOriginSession())) {
     throw new Error('نشست Code Review پیش از برگشت نتیجه پایان یافت.');
@@ -233,11 +293,15 @@ async function returnResultToConversation(call: ParsedReadCall, result: unknown)
   }
 
   const wrapper = `<function_result call_id="${call.callId}">\n${resultToText(result)}\n</function_result>`;
-  const inserted = await adapter.insertText(wrapper);
-  if (!inserted) throw new Error('نتیجه ابزار GitHub در گفتگو درج نشد.');
 
-  const submitted = await adapter.submitForm();
-  if (!submitted) throw new Error('نتیجه ابزار GitHub برای مدل ارسال نشد.');
+  // If a previous delivery attempt left the exact function result in the
+  // composer, retry only submission. Never append a duplicate wrapper.
+  if (!composerContainsResult(call.callId)) {
+    const inserted = await adapter.insertText(wrapper);
+    if (!inserted) throw new Error('نتیجه ابزار GitHub در گفتگو درج نشد.');
+  }
+
+  await submitInsertedResult(adapter, call.callId);
 }
 
 async function executeApprovedRead(source: HTMLElement, call: ParsedReadCall): Promise<void> {
@@ -255,21 +319,33 @@ async function executeApprovedRead(source: HTMLElement, call: ParsedReadCall): P
     const session = await getOriginSession();
     if (!session?.id) return;
 
-    const result = await executeThroughSharedMcpClient(call);
-    const authChallenge = parseGitHubDeviceAuthChallenge(result);
+    const cached = resultBySource.get(source);
+    let result: unknown;
 
-    if (authChallenge) {
-      source.setAttribute('data-code-review-read-auth-required', 'true');
-      source.setAttribute('data-code-review-read-final-error', 'true');
-      retryAfterBySource.delete(source);
-      attemptsBySource.delete(source);
+    if (cached?.key === key) {
+      result = cached.result;
+    } else {
+      result = await executeThroughSharedMcpClient(call);
+      const authChallenge = parseGitHubDeviceAuthChallenge(result);
 
-      emitRuntimeToast(
-        'GitHub MCP نیاز به احراز هویت دارد',
-        'GitHub MCP به‌جای محتوای مخزن، Device Login برگرداند. کد ورود برای امنیت به مدل ارسال نشد. GITHUB_PERSONAL_ACCESS_TOKEN را در محیط Proxy/Container تنظیم کنید و سپس درخواست مخزن را دوباره اجرا کنید.',
-        'warning',
-      );
-      return;
+      if (authChallenge) {
+        source.setAttribute('data-code-review-read-auth-required', 'true');
+        source.setAttribute('data-code-review-read-final-error', 'true');
+        retryAfterBySource.delete(source);
+        attemptsBySource.delete(source);
+
+        emitRuntimeToast(
+          'GitHub MCP نیاز به احراز هویت دارد',
+          'GitHub MCP به‌جای محتوای مخزن، Device Login برگرداند. کد ورود برای امنیت به مدل ارسال نشد. GITHUB_PERSONAL_ACCESS_TOKEN را در محیط Proxy/Container تنظیم کنید و سپس درخواست مخزن را دوباره اجرا کنید.',
+          'warning',
+        );
+        return;
+      }
+
+      // Cache the already-authorized GitHub response before delivery. If the
+      // host composer temporarily fails to submit, retries must not spend a
+      // second Gate call or re-read GitHub.
+      resultBySource.set(source, { key, result });
     }
 
     if (!(await getOriginSession())) {
@@ -279,6 +355,7 @@ async function executeApprovedRead(source: HTMLElement, call: ParsedReadCall): P
     await returnResultToConversation(call, result);
 
     completedCalls.add(key);
+    resultBySource.delete(source);
     source.setAttribute('data-code-review-read-executed', 'true');
     source.removeAttribute('data-code-review-read-error');
     retryAfterBySource.delete(source);
