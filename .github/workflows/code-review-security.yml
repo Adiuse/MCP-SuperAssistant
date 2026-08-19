@@ -37,3 +37,5 @@ jobs:
         run: pnpm exec node tests/code-review-tool-alias.mjs
       - name: Run approved read executor contract
         run: pnpm exec node tests/code-review-read-executor-contract.mjs
+      - name: Run visible MCP connection settings contract
+        run: pnpm exec node tests/mcp-connection-settings-contract.mjs
