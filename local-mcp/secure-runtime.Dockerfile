@@ -3,7 +3,7 @@ FROM node:22-bookworm-slim
 ARG MCP_PROXY_VERSION=0.1.8
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates docker.io \
+  && apt-get install -y --no-install-recommends bash ca-certificates docker.io socat \
   && rm -rf /var/lib/apt/lists/* \
   && npm install --global "@srbhptl39/mcp-superassistant-proxy@${MCP_PROXY_VERSION}"
 
