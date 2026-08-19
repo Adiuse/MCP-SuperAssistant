@@ -2,9 +2,9 @@
 import http from 'node:http';
 import { Readable } from 'node:stream';
 
-const DEFAULT_HOST = process.env.MCP_GATEWAY_HOST || 'localhost';
+const DEFAULT_HOST = process.env.MCP_GATEWAY_HOST || '127.0.0.1';
 const DEFAULT_PORT = Number(process.env.MCP_GATEWAY_PORT || 38106);
-const DEFAULT_UPSTREAM = process.env.MCP_UPSTREAM_URL || 'http://localhost:38107/mcp';
+const DEFAULT_UPSTREAM = process.env.MCP_UPSTREAM_URL || 'http://127.0.0.1:38107/mcp';
 const DEVICE_HEADER = 'x-mcp-superassistant-device';
 const CONTROL_HEADER = 'x-mcp-superassistant-extension-control';
 const CONTROL_PREFIX = '/__mcp_superassistant/code-review';
@@ -306,7 +306,7 @@ export function createCapabilityGatewayServer({ state = createGatewayState(), up
         return sendJson(res, 403, { ok: false, error: 'loopback clients only' });
       }
 
-      const requestUrl = new URL(req.url || '/', 'http://localhost');
+      const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
       if (requestUrl.pathname.startsWith(CONTROL_PREFIX)) {
         setControlCors(req, res);
         if (req.method === 'OPTIONS') {
