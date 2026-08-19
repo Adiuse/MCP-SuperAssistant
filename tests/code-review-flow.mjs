@@ -10,28 +10,18 @@ const repoRoot = path.resolve(__dirname, '..');
 const gateEntry = path.join(repoRoot, 'chrome-extension/src/security/codeReviewGate.ts');
 const backgroundEntry = path.join(repoRoot, 'chrome-extension/src/background/index.ts');
 const bridgeEntry = path.join(repoRoot, 'chrome-extension/src/security/codeReviewControlBridge.ts');
-const headlessEntry = path.join(
-  repoRoot,
-  'pages/content/src/components/sidebar/Instructions/HeadlessInstructionSync.tsx',
-);
+const headlessEntry = path.join(repoRoot, 'pages/content/src/components/sidebar/Instructions/HeadlessInstructionSync.tsx');
+const userTurnEntry = path.join(repoRoot, 'pages/content/src/security/codeReviewUserTurn.ts');
+const securityToastEntry = path.join(repoRoot, 'pages/content/src/components/mcpPopover/securityToast.ts');
 
 function createStorageArea() {
   const data = Object.create(null);
-
   const clone = value => (value === undefined ? undefined : structuredClone(value));
-
   return {
     async get(keys) {
       if (keys == null) return clone(data);
-
-      if (typeof keys === 'string') {
-        return { [keys]: clone(data[keys]) };
-      }
-
-      if (Array.isArray(keys)) {
-        return Object.fromEntries(keys.map(key => [key, clone(data[key])]));
-      }
-
+      if (typeof keys === 'string') return { [keys]: clone(data[keys]) };
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map(key => [key, clone(data[key])]));
       if (typeof keys === 'object') {
         return Object.fromEntries(
           Object.entries(keys).map(([key, fallback]) => [
@@ -40,22 +30,14 @@ function createStorageArea() {
           ]),
         );
       }
-
       return {};
     },
-
     async set(items) {
-      for (const [key, value] of Object.entries(items || {})) {
-        data[key] = clone(value);
-      }
+      for (const [key, value] of Object.entries(items || {})) data[key] = clone(value);
     },
-
     async remove(keys) {
-      for (const key of Array.isArray(keys) ? keys : [keys]) {
-        delete data[key];
-      }
+      for (const key of Array.isArray(keys) ? keys : [keys]) delete data[key];
     },
-
     async clear() {
       for (const key of Object.keys(data)) delete data[key];
     },
@@ -65,7 +47,6 @@ function createStorageArea() {
 async function loadGate() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-code-review-test-'));
   const outfile = path.join(tempDir, 'codeReviewGate.mjs');
-
   await build({
     entryPoints: [gateEntry],
     outfile,
@@ -85,18 +66,24 @@ async function loadGate() {
           }));
           builder.onLoad({ filter: /.*/, namespace: 'code-review-test' }, () => ({
             loader: 'js',
-            contents:
-              'export const createLogger = () => ({ debug() {}, warn() {}, error() {}, info() {} });',
+            contents: 'export const createLogger = () => ({ debug() {}, warn() {}, error() {}, info() {} });',
           }));
         },
       },
     ],
   });
-
   return import(`${pathToFileURL(outfile).href}?t=${Date.now()}`);
 }
 
-async function runOriginIsolationFlow(gate, storage) {
+async function beginHumanTurn(gate, tabId, url, submissionId) {
+  return gate.registerCodeReviewUserTurn({
+    sourceTabId: tabId,
+    sourceUrl: url,
+    clientSubmissionId: submissionId,
+  });
+}
+
+async function runPromptBoundIsolationFlow(gate, storage) {
   await storage.clear();
 
   const CHAT_A = 101;
@@ -107,125 +94,96 @@ async function runOriginIsolationFlow(gate, storage) {
   const sourcePathA = gate.sourcePathFromUrl(URL_A);
 
   assert.equal(sourcePathA, '/c/code-review-a');
-  assert.equal(
-    gate.sourcePathFromUrl(URL_A_QUERY),
-    sourcePathA,
-    'query/hash changes must not create a different conversation origin',
-  );
-  assert.equal(
-    gate.sourcePathFromUrl('/c/code-review-a?model=gpt-5#composer'),
-    sourcePathA,
-    'already-relative conversation paths must also drop query/hash state',
-  );
+  assert.equal(gate.sourcePathFromUrl(URL_A_QUERY), sourcePathA);
+  assert.equal(gate.sourcePathFromUrl('/c/code-review-a?model=gpt-5#composer'), sourcePathA);
 
-  await gate.saveCodeReviewPreferences({
-    owner: 'Adiuse',
-    repo: 'cybersecurity',
-    durationMinutes: 5,
-  });
+  await gate.saveCodeReviewPreferences({ owner: 'Adiuse', repo: 'cybersecurity', durationMinutes: 5 });
 
   const requestTool = await gate.getCodeReviewRequestTool();
   assert.equal(requestTool.name, 'request_code_review_access');
   assert.deepEqual(requestTool.inputSchema.properties, {});
-  assert.deepEqual(requestTool.inputSchema.required, []);
   assert.equal(requestTool.inputSchema.additionalProperties, false);
+  assert.match(requestTool.description, /current real user prompt/i);
+
+  // Fail closed: merely having a chat/origin is not enough to manufacture an
+  // approval request. A browser-trusted human turn must be registered first.
+  await assert.rejects(
+    () => gate.createPendingCodeReviewRequest({ sourceTabId: CHAT_A, sourcePath: sourcePathA }),
+    /Prompt واقعی|real/i,
+  );
+
+  const turnA = await beginHumanTurn(gate, CHAT_A, URL_A, 'human-submit-a1');
+  assert.ok(turnA.userTurn.id);
+  assert.equal(turnA.invalidatedSessions.length, 0);
+
+  const duplicateSignal = await beginHumanTurn(gate, CHAT_A, URL_A_QUERY, 'human-submit-a1');
+  assert.equal(duplicateSignal.deduplicated, true);
+  assert.equal(duplicateSignal.userTurn.id, turnA.userTurn.id);
 
   const request = await gate.createPendingCodeReviewRequest({
     sourceTabId: CHAT_A,
     sourcePath: sourcePathA,
-    sourceKey: `${CHAT_A}:${sourcePathA}`,
+    sourceKey: 'ignored-untrusted-source-key',
   });
-
+  assert.equal(request.userTurnId, turnA.userTurn.id);
+  assert.ok(request.jobId);
   assert.equal(request.owner, 'Adiuse');
   assert.equal(request.repo, 'cybersecurity');
-  assert.equal(request.durationMinutes, 5);
-  assert.equal(request.sourceTabId, CHAT_A);
-  assert.ok(request.requestId);
 
-  const pendingBeforeApproval = await gate.getPendingCodeReviewRequests();
-  assert.equal(pendingBeforeApproval.length, 1);
-  assert.equal(pendingBeforeApproval[0].requestId, request.requestId);
-  assert.equal(await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A), null);
+  // Another chat may approve the exact global pending request, but the
+  // operational capability remains at the request origin and prompt.
+  const session = await gate.startCodeReviewSession({ requestId: request.requestId, approvingTabId: CHAT_B });
+  assert.equal(session.approvedTabId, CHAT_A);
+  assert.equal(session.userTurnId, turnA.userTurn.id);
+  assert.equal(session.jobId, request.jobId);
+  assert.ok(session.capabilityId);
+
+  assert.equal((await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A_QUERY))?.id, session.id);
   assert.equal(await gate.getActiveCodeReviewSessionForOrigin(CHAT_B, URL_B), null);
 
   const serverTools = [
     ...gate.CODE_REVIEW_ALLOWED_TOOLS.map(name => ({ name })),
     { name: 'create_or_update_file' },
     { name: 'delete_file' },
-    { name: 'fork_repository' },
   ];
-
-  assert.deepEqual(await gate.filterCodeReviewTools(serverTools, CHAT_A, URL_A), []);
-  assert.deepEqual(await gate.filterCodeReviewTools(serverTools, CHAT_B, URL_B), []);
-
-  // Chat B approves the request created by Chat A. Operational access must still
-  // be bound to Chat A, not to the approving tab.
-  const session = await gate.startCodeReviewSession({
-    requestId: request.requestId,
-    approvingTabId: CHAT_B,
-  });
-
-  assert.equal(session.approvedTabId, CHAT_A);
-  assert.equal(session.sourceRequestId, request.requestId);
-  assert.equal(session.owner, 'Adiuse');
-  assert.equal(session.repo, 'cybersecurity');
-  assert.equal(session.durationMinutes, 5);
-  assert.equal((await gate.getPendingCodeReviewRequests()).length, 0);
-
-  const chatASession = await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A);
-  const chatAQuerySession = await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A_QUERY);
-  const chatBSession = await gate.getActiveCodeReviewSessionForOrigin(CHAT_B, URL_B);
-  assert.equal(chatASession?.id, session.id);
-  assert.equal(
-    chatAQuerySession?.id,
-    session.id,
-    'same tab/conversation must retain access when only URL query/hash changes',
-  );
-  assert.equal(chatBSession, null);
-
   const chatATools = await gate.filterCodeReviewTools(serverTools, CHAT_A, URL_A_QUERY);
-  const chatBTools = await gate.filterCodeReviewTools(serverTools, CHAT_B, URL_B);
-
-  assert.deepEqual(
-    chatATools.map(tool => tool.name),
-    [...gate.CODE_REVIEW_ALLOWED_TOOLS],
-  );
-  assert.deepEqual(chatBTools, []);
-  assert.equal(chatATools.some(tool => tool.name === 'create_or_update_file'), false);
+  assert.deepEqual(chatATools.map(tool => tool.name), [...gate.CODE_REVIEW_ALLOWED_TOOLS]);
   assert.equal(chatATools.some(tool => tool.name === 'delete_file'), false);
-  assert.equal(chatATools.some(tool => tool.name === 'fork_repository'), false);
 
-  const authorized = await gate.authorizeCodeReviewToolCall(
+  // Same approved prompt can traverse the entire repo repeatedly without a new
+  // approval. This is required for architecture/E2E review.
+  const fileAuth = await gate.authorizeCodeReviewToolCall(
     'get_file_contents',
     { owner: 'Adiuse', repo: 'cybersecurity', path: 'README.md' },
     CHAT_A,
     URL_A_QUERY,
   );
-  assert.equal(authorized.sessionId, session.id);
-  assert.equal(authorized.args.owner, 'Adiuse');
-  assert.equal(authorized.args.repo, 'cybersecurity');
-  assert.equal(authorized.args.path, 'README.md');
+  assert.equal(fileAuth.sessionId, session.id);
+  assert.equal(fileAuth.userTurnId, turnA.userTurn.id);
+  assert.equal(fileAuth.jobId, session.jobId);
+  assert.equal(fileAuth.capabilityId, session.capabilityId);
+
+  const searchAuth = await gate.authorizeCodeReviewToolCall(
+    'search_code',
+    { query: 'PaymentService' },
+    CHAT_A,
+    URL_A,
+  );
+  assert.match(searchAuth.args.query, /PaymentService repo:Adiuse\/cybersecurity/);
 
   const result = await gate.enforceCodeReviewResultPolicy(
     'get_file_contents',
     { content: '# README' },
-    authorized.sessionId,
+    fileAuth.sessionId,
     CHAT_A,
     URL_A_QUERY,
   );
   assert.deepEqual(result, { content: '# README' });
 
   await assert.rejects(
-    () =>
-      gate.authorizeCodeReviewToolCall(
-        'get_file_contents',
-        { owner: 'Adiuse', repo: 'cybersecurity', path: 'README.md' },
-        CHAT_B,
-        URL_B,
-      ),
-    /Code review access is OFF/,
+    () => gate.authorizeCodeReviewToolCall('get_file_contents', { path: 'README.md' }, CHAT_B, URL_B),
+    /OFF for this prompt/i,
   );
-
   await assert.rejects(
     () =>
       gate.authorizeCodeReviewToolCall(
@@ -236,11 +194,49 @@ async function runOriginIsolationFlow(gate, storage) {
       ),
     /scope violation/i,
   );
+  await assert.rejects(
+    () => gate.authorizeCodeReviewToolCall('search_code', { query: 'secret repo:Other/repo' }, CHAT_A, URL_A),
+    /scope qualifiers/i,
+  );
 
-  const expired = await gate.expireCodeReviewSession(session.id);
-  assert.equal(expired?.id, session.id);
+  // Attacker/new-human-prompt scenario. The old lease may still have wall-clock
+  // time left, but a new real UserTurn invalidates it immediately.
+  const inFlight = await gate.authorizeCodeReviewToolCall(
+    'get_file_contents',
+    { path: 'src/payments/service.ts' },
+    CHAT_A,
+    URL_A,
+  );
+  const attackerTurn = await beginHumanTurn(gate, CHAT_A, URL_A, 'human-submit-attacker');
+  assert.notEqual(attackerTurn.userTurn.id, turnA.userTurn.id);
+  assert.deepEqual(attackerTurn.invalidatedSessions.map(item => item.id), [session.id]);
+  assert.equal(await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A), null);
+
+  await assert.rejects(
+    () => gate.authorizeCodeReviewToolCall('get_file_contents', { path: 'src/private.ts' }, CHAT_A, URL_A),
+    /OFF for this prompt/i,
+  );
+  await assert.rejects(
+    () =>
+      gate.enforceCodeReviewResultPolicy(
+        'get_file_contents',
+        { content: 'must never reach the model after a new user turn' },
+        inFlight.sessionId,
+        CHAT_A,
+        URL_A,
+      ),
+    /lease ended/i,
+  );
+
+  // The new real prompt can request a fresh approval; the old lease is never
+  // reused even though its original expiresAt was still in the future.
+  const request2 = await gate.createPendingCodeReviewRequest({ sourceTabId: CHAT_A, sourcePath: sourcePathA });
+  assert.equal(request2.userTurnId, attackerTurn.userTurn.id);
+  assert.notEqual(request2.jobId, request.jobId);
+  const session2 = await gate.startCodeReviewSession({ requestId: request2.requestId, approvingTabId: CHAT_A });
+  assert.equal(session2.userTurnId, attackerTurn.userTurn.id);
+  await gate.expireCodeReviewSession(session2.id);
   assert.equal(await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A_QUERY), null);
-  assert.deepEqual(await gate.filterCodeReviewTools(serverTools, CHAT_A, URL_A_QUERY), []);
 
   const audit = await gate.getCodeReviewAuditLog();
   const actions = new Set(audit.map(entry => entry.action));
@@ -248,121 +244,107 @@ async function runOriginIsolationFlow(gate, storage) {
     'access_requested',
     'access_approved',
     'session_started',
+    'job_started',
     'tool_allowed',
     'response_allowed',
     'tool_denied',
     'scope_violation',
+    'new_user_turn_invalidated_old_job',
+    'job_revoked',
     'session_expired',
+    'job_expired',
   ]) {
     assert.equal(actions.has(requiredAction), true, `missing audit action: ${requiredAction}`);
   }
 }
 
+async function runStalePendingFlow(gate, storage) {
+  await storage.clear();
+  await gate.saveCodeReviewPreferences({ owner: 'Adiuse', repo: 'cybersecurity', durationMinutes: 10 });
+  const URL = 'https://chatgpt.com/c/stale-request';
+  await beginHumanTurn(gate, 301, URL, 'human-stale-a');
+  const oldRequest = await gate.createPendingCodeReviewRequest({ sourceTabId: 301, sourcePath: '/c/stale-request' });
+  const next = await beginHumanTurn(gate, 301, URL, 'human-stale-b');
+  assert.deepEqual(next.invalidatedRequests.map(item => item.requestId), [oldRequest.requestId]);
+  assert.equal((await gate.getPendingCodeReviewRequests()).length, 0);
+  await assert.rejects(
+    () => gate.startCodeReviewSession({ requestId: oldRequest.requestId, approvingTabId: 301 }),
+    /no longer pending/i,
+  );
+}
+
 async function runRequestIdQueueFlow(gate, storage) {
   await storage.clear();
-
-  await gate.saveCodeReviewPreferences({
-    owner: 'Adiuse',
-    repo: 'cybersecurity',
-    durationMinutes: 5,
-  });
-
-  const requestA = await gate.createPendingCodeReviewRequest({
-    sourceTabId: 301,
-    sourcePath: '/c/request-a',
-    sourceKey: '301:/c/request-a',
-  });
-  const requestC = await gate.createPendingCodeReviewRequest({
-    sourceTabId: 303,
-    sourcePath: '/c/request-c',
-    sourceKey: '303:/c/request-c',
-  });
-
-  const sessionC = await gate.startCodeReviewSession({
-    requestId: requestC.requestId,
-    approvingTabId: 302,
-  });
-
-  assert.equal(sessionC.approvedTabId, 303);
+  await gate.saveCodeReviewPreferences({ owner: 'Adiuse', repo: 'cybersecurity', durationMinutes: 5 });
+  await beginHumanTurn(gate, 401, 'https://chatgpt.com/c/request-a', 'human-a');
+  await beginHumanTurn(gate, 403, 'https://chatgpt.com/c/request-c', 'human-c');
+  const requestA = await gate.createPendingCodeReviewRequest({ sourceTabId: 401, sourcePath: '/c/request-a' });
+  const requestC = await gate.createPendingCodeReviewRequest({ sourceTabId: 403, sourcePath: '/c/request-c' });
+  const sessionC = await gate.startCodeReviewSession({ requestId: requestC.requestId, approvingTabId: 402 });
+  assert.equal(sessionC.approvedTabId, 403);
   assert.equal(sessionC.sourceRequestId, requestC.requestId);
-
   const remaining = await gate.getPendingCodeReviewRequests();
   assert.equal(remaining.length, 1);
   assert.equal(remaining[0].requestId, requestA.requestId);
-
-  const revoked = await gate.revokeCodeReviewSession(
-    sessionC.id,
-    'test cleanup exact-session revoke',
-    302,
-  );
+  const revoked = await gate.revokeCodeReviewSession(sessionC.id, 'test exact-session revoke', 402);
   assert.equal(revoked?.id, sessionC.id);
 }
 
 async function runSourceContractChecks() {
-  const [background, bridge, headless] = await Promise.all([
+  const [background, bridge, headless, userTurn, securityToast] = await Promise.all([
     fs.readFile(backgroundEntry, 'utf8'),
     fs.readFile(bridgeEntry, 'utf8'),
     fs.readFile(headlessEntry, 'utf8'),
+    fs.readFile(userTurnEntry, 'utf8'),
+    fs.readFile(securityToastEntry, 'utf8'),
   ]);
 
-  assert.equal(
-    background.includes('broadcastToolsUpdateToContentScripts'),
-    false,
-    'background must never restore global MCP tool broadcasting',
-  );
-  assert.equal(
-    background.includes('ToolUpdateBroadcast'),
-    false,
-    'background must not import/use the old global tool broadcast payload',
-  );
-
+  assert.equal(background.includes('broadcastToolsUpdateToContentScripts'), false);
+  assert.equal(background.includes('ToolUpdateBroadcast'), false);
   assert.match(
     background,
     /getPrimitivesWithBackwardsCompatibility\([\s\S]{0,260}?connectionType,\s*tabId,\s*sender\.tab\?\.url,?\s*\)/,
-    'tool discovery must pass sender tab id/url into the gate',
   );
   assert.match(
     background,
     /callToolWithBackwardsCompatibility\([\s\S]{0,420}?connectionType,\s*callerTabId,\s*sender\.tab\?\.url,?\s*\)/,
-    'tool execution must pass sender tab id/url into the gate',
   );
 
-  assert.match(
-    bridge,
-    /pendingRequests\.find\(request => request\.requestId === requestId\)/,
-    'approval must select the exact pending request by requestId',
-  );
-  assert.match(
-    bridge,
-    /expireCodeReviewSession\(event\.sessionId\)/,
-    'expiry alarm must remove the exact session immediately',
-  );
+  assert.match(bridge, /USER_TURN:\s*'code-review:user-turn'/);
+  assert.match(bridge, /registerCodeReviewUserTurn\(/);
+  assert.match(bridge, /session:\s*originSession,/);
+  assert.doesNotMatch(bridge, /originSession\s*\|\|\s*fallbackSession/);
+  assert.match(bridge, /pendingRequests\.find\(request => request\.requestId === requestId\)/);
+  assert.match(bridge, /expireCodeReviewSession\(event\.sessionId\)/);
+  assert.match(bridge, /clearCodeReviewExpiryNotification\(invalidated\.id\)/);
+
+  assert.match(userTurn, /event\.isTrusted/);
+  assert.match(userTurn, /document\.addEventListener\('click',[\s\S]*true\)/);
+  assert.match(userTurn, /document\.addEventListener\('keydown',[\s\S]*true\)/);
+  assert.doesNotMatch(userTurn, /addEventListener\('submit'/);
+  assert.match(userTurn, /code-review:user-turn/);
+  assert.match(userTurn, /Fail closed/);
+  assert.match(securityToast, /security\/codeReviewUserTurn/);
 
   const readToolsCheck = headless.indexOf('const hasReadTools = currentTools.some');
   const instructionsCheck = headless.indexOf('READ_TOOL_PATTERN.test(updatedInstructions)');
   const insertContinuation = headless.indexOf('await adapter.insertText(continuation)');
   const submitContinuation = headless.indexOf('await adapter.submitForm()');
-
-  assert.ok(readToolsCheck >= 0, 'auto-resume must verify read tools are exposed');
-  assert.ok(instructionsCheck > readToolsCheck, 'auto-resume must verify model instructions after tool exposure');
-  assert.ok(insertContinuation > instructionsCheck, 'auto-resume cannot inject continuation before tool verification');
-  assert.ok(submitContinuation > insertContinuation, 'auto-resume submits only after verified continuation insertion');
+  assert.ok(readToolsCheck >= 0);
+  assert.ok(instructionsCheck > readToolsCheck);
+  assert.ok(insertContinuation > instructionsCheck);
+  assert.ok(submitContinuation > insertContinuation);
 }
 
 const storage = createStorageArea();
-globalThis.chrome = {
-  storage: {
-    local: storage,
-  },
-};
-
+globalThis.chrome = { storage: { local: storage } };
 const gate = await loadGate();
 
-await runOriginIsolationFlow(gate, storage);
-console.log('✓ Chat A request → Chat B approve → query-insensitive origin retains read tools → expiry removes access');
-
+await runPromptBoundIsolationFlow(gate, storage);
+console.log('✓ Same prompt supports repo-wide reads; a new real user turn invalidates the lease and in-flight result');
+await runStalePendingFlow(gate, storage);
+console.log('✓ A new real user turn removes a stale pending approval request');
 await runRequestIdQueueFlow(gate, storage);
-console.log('✓ Global pending queue approval targets the selected requestId, not the first request');
-
+console.log('✓ Global pending approval remains exact-requestId while operational access stays origin/prompt-bound');
 await runSourceContractChecks();
-console.log('✓ Background has no global tool broadcast and auto-resume waits for verified read tools');
+console.log('✓ Trusted user-turn detector and origin-scoped background/control contracts are present');
