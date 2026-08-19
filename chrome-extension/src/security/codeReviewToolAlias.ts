@@ -3,11 +3,30 @@ export interface NamedTool {
   [key: string]: any;
 }
 
-function terminalToolSegment(name: string): string {
+const GITHUB_NAMESPACE_PREFIX = /^(?:[a-z0-9]+[-_.:/]+)*github(?:[-_.:/]+review)?[-_.:/]+$/i;
+
+function canonicalSuffixFromGithubNamespace(
+  name: string,
+  allowedTools: readonly string[],
+): string | null {
   const clean = String(name || '').trim();
-  if (!clean) return '';
-  const segments = clean.split(/[.:/]/g).filter(Boolean);
-  return segments[segments.length - 1] || clean;
+  if (!clean) return null;
+
+  // Match the longest allowlisted suffix first. This avoids treating an
+  // underscore inside the canonical tool name itself as a namespace boundary.
+  const candidates = [...allowedTools].sort((a, b) => b.length - a.length);
+  for (const canonical of candidates) {
+    if (!clean.endsWith(canonical)) continue;
+    const prefix = clean.slice(0, -canonical.length);
+    if (!prefix) continue;
+
+    // Only known GitHub/GitHub-review namespaces may alias into the privileged
+    // Code Review allowlist. A different MCP server that happens to expose a
+    // similarly named tool must never acquire GitHub Code Review capability.
+    if (GITHUB_NAMESPACE_PREFIX.test(prefix)) return canonical;
+  }
+
+  return null;
 }
 
 export function canonicalizeScopedToolName(
@@ -19,15 +38,16 @@ export function canonicalizeScopedToolName(
   if (!clean) return null;
   if (allowed.has(clean)) return clean;
 
-  const terminal = terminalToolSegment(clean);
-  return allowed.has(terminal) ? terminal : null;
+  return canonicalSuffixFromGithubNamespace(clean, allowedTools);
 }
 
 /**
  * Expose only the approved canonical tool names to the model. MCP aggregators
- * commonly namespace tools (for example `github.get_file_contents`). Exact
- * unprefixed names win. A prefixed alias is exposed only when it resolves
- * unambiguously to one server tool; ambiguous aliases are omitted entirely.
+ * may namespace the configured `github-review` server in forms such as
+ * `github.get_file_contents`, `github-review__get_file_contents`, or
+ * `github_review_get_file_contents`. Exact unprefixed names win. A GitHub-
+ * namespaced alias is exposed only when it resolves unambiguously to one server
+ * tool; ambiguous aliases are omitted entirely.
  */
 export function aliasScopedTools<T extends NamedTool>(
   tools: readonly T[],
@@ -87,6 +107,6 @@ export function resolveScopedServerToolName(
   }
 
   throw new Error(
-    `Approved GitHub tool '${canonicalName}' is ambiguous across MCP server namespaces`,
+    `Approved GitHub tool '${canonicalName}' is ambiguous across GitHub MCP server namespaces`,
   );
 }
