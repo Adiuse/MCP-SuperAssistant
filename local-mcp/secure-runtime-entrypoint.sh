@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="${MCP_SUPERASSISTANT_CONFIG:-/run/config/config.json}"
-GITHUB_ENV_PATH="${MCP_SUPERASSISTANT_GITHUB_ENV:-/run/secrets/github.env}"
+CONFIG_PATH="${MCP_SUPERASSISTANT_CONFIG:-/run/bootstrap/config.json}"
+GITHUB_ENV_PATH="${MCP_SUPERASSISTANT_GITHUB_ENV:-/run/bootstrap/github.env}"
 PUBLIC_PORT="${MCP_GATEWAY_PUBLIC_PORT:-38106}"
 GATEWAY_INTERNAL_PORT="${MCP_GATEWAY_INTERNAL_PORT:-38108}"
 UPSTREAM_PORT="${MCP_UPSTREAM_PORT:-38107}"
@@ -24,7 +24,7 @@ source "$GITHUB_ENV_PATH"
 set +a
 
 if [[ -z "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ]]; then
-  echo "GITHUB_PERSONAL_ACCESS_TOKEN is not exported by: $GITHUB_ENV_PATH" >&2
+  echo "GITHUB_PERSONAL_ACCESS_TOKEN is not exported by the runtime credential file." >&2
   exit 1
 fi
 
