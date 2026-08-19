@@ -17,6 +17,7 @@ const READ_TOOL_NAMES = new Set([
 ]);
 
 const MAX_EXECUTION_ATTEMPTS = 3;
+const GITHUB_DEVICE_LOGIN_URL = 'https://github.com/login/device';
 
 type ParsedReadCall = {
   toolName: string;
@@ -36,6 +37,11 @@ type StatusResponse = {
 
 type AutomationState = {
   autoExecute: boolean;
+};
+
+type GitHubDeviceAuthChallenge = {
+  verificationUrl: string;
+  userCode?: string;
 };
 
 declare global {
@@ -175,6 +181,18 @@ function resultToText(result: unknown): string {
   return String(result ?? '');
 }
 
+function parseGitHubDeviceAuthChallenge(result: unknown): GitHubDeviceAuthChallenge | null {
+  const text = resultToText(result);
+  if (!text.includes(GITHUB_DEVICE_LOGIN_URL)) return null;
+  if (!/authorize the GitHub MCP Server|device[- ]code|enter the code/i.test(text)) return null;
+
+  const codeMatch = text.match(/enter the code\s+([A-Z0-9-]+)/i);
+  return {
+    verificationUrl: GITHUB_DEVICE_LOGIN_URL,
+    userCode: codeMatch?.[1],
+  };
+}
+
 async function getOriginSession(): Promise<StatusResponse['originSession']> {
   const response = (await chrome.runtime.sendMessage({ type: REVIEW_STATUS_MESSAGE })) as StatusResponse;
   if (!response?.success || !response.originSession) return null;
@@ -238,6 +256,21 @@ async function executeApprovedRead(source: HTMLElement, call: ParsedReadCall): P
     if (!session?.id) return;
 
     const result = await executeThroughSharedMcpClient(call);
+    const authChallenge = parseGitHubDeviceAuthChallenge(result);
+
+    if (authChallenge) {
+      source.setAttribute('data-code-review-read-auth-required', 'true');
+      source.setAttribute('data-code-review-read-final-error', 'true');
+      retryAfterBySource.delete(source);
+      attemptsBySource.delete(source);
+
+      emitRuntimeToast(
+        'GitHub MCP نیاز به احراز هویت دارد',
+        'GitHub MCP به‌جای محتوای مخزن، Device Login برگرداند. کد ورود برای امنیت به مدل ارسال نشد. GITHUB_PERSONAL_ACCESS_TOKEN را در محیط Proxy/Container تنظیم کنید و سپس درخواست مخزن را دوباره اجرا کنید.',
+        'warning',
+      );
+      return;
+    }
 
     if (!(await getOriginSession())) {
       throw new Error('نشست Code Review پیش از برگشت نتیجه پایان یافت.');
@@ -339,5 +372,6 @@ export const codeReviewReadExecutorTestUtils = {
   generalAutoExecuteEnabled,
   getAutomationState,
   parseApprovedReadCall,
+  parseGitHubDeviceAuthChallenge,
   resultToText,
 };
