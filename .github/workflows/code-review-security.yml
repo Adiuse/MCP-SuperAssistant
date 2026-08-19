@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - agent/finalize-code-review-business-logic
+      - agent/prompt-bound-github-gateway
   pull_request:
     branches:
       - dev
@@ -26,7 +27,7 @@ jobs:
       - run: pnpm install --frozen-lockfile --prefer-offline
       - name: Type-check Chrome extension
         run: pnpm --filter chrome-extension type-check
-      - name: Run Code Review isolation and expiry flow
+      - name: Run prompt-bound Code Review security flow
         run: pnpm exec node tests/code-review-flow.mjs
       - name: Run Code Review DOM request contract
         run: pnpm exec node tests/code-review-dom-request-contract.mjs
