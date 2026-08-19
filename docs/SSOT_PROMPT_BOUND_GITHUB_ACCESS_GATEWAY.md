@@ -26,7 +26,9 @@ Gateway / Proxy
 GitHub
 ```
 
-MCP در صورت استفاده فقط **Transport / Tool Execution Mechanism** است. هسته امنیت، Gate و Lease هستند.
+MCP حذف نشده و همچنان **Transport / Tool Execution Mechanism** این Flow است. Extension برای اجرای Toolهای GitHub از MCP با Transport نوع `Streamable HTTP` استفاده می‌کند؛ Gateway فقط لایه‌ی Security Enforcement جلوی MCP Proxy است و جای MCP را نمی‌گیرد.
+
+هسته امنیت، Gate و Lease هستند؛ MCP لایه‌ی انتقال و اجرای Tool باقی می‌ماند.
 
 ---
 
@@ -543,6 +545,139 @@ Capability missing ❌
 
 ---
 
+## 24.1. Secure Local MCP Runtime و الزام `127.0.0.1`
+
+MCP در این معماری حذف یا دور زده نشده است. اتصال Browser Extension به Runtime همچنان یک اتصال MCP با Transport نوع `Streamable HTTP` است. Gateway فقط جلوی MCP Proxy قرار می‌گیرد تا قبل از هر GitHub Read، Capability و Scope را enforce کند.
+
+Endpoint رسمی و Canonical روی Host:
+
+```text
+Transport: Streamable HTTP
+URL: http://127.0.0.1:38106/mcp
+```
+
+برای Front Door روی Host باید از `127.0.0.1` استفاده شود، نه `localhost`.
+
+```text
+Host bind = 127.0.0.1
+Host published port = 38106 only
+```
+
+علت این الزام این است که `localhost` می‌تواند بسته به Resolver سیستم به IPv4 یا IPv6 مانند `::1` resolve شود و باعث ambiguity، تفاوت رفتار یا bind ناخواسته شود. در Security Boundary مربوط به Host باید Loopback به‌صورت صریح با `127.0.0.1` مشخص شود.
+
+توپولوژی Runtime فعلی:
+
+```text
+ChatGPT / Browser Extension
+        ↓
+MCP Streamable HTTP
+http://127.0.0.1:38106/mcp
+        ↓
+Host-published loopback port only
+        ↓
+[ Isolated Secure Runtime Container ]
+        ↓
+Front-door forwarder :38106
+        ↓
+Capability Gateway 127.0.0.1:38108
+        ↓
+PAT-bearing MCP Proxy :38107
+        ↓
+GitHub MCP Server
+        ↓
+GitHub
+```
+
+قواعد الزامی این Runtime:
+
+```text
+Host-visible:
+127.0.0.1:38106 only
+
+Host-not-published:
+38107 PAT-bearing MCP Proxy
+38108 internal Capability Gateway
+```
+
+پورت `38107` که PAT-bearing MCP Proxy روی آن اجرا می‌شود نباید به Host publish شود. پورت داخلی Gateway نیز نباید مستقیماً روی Host publish شود. تنها Front Door مجاز، `127.0.0.1:38106` است و درخواست از آنجا باید قبل از رسیدن به Proxy از Capability Gateway عبور کند.
+
+داخل Secure Runtime، Gateway علاوه بر Policy اصلی باید موارد زیر را دوباره enforce کند:
+
+```text
+Valid Extension device credential
+Active prompt-bound Lease
+Same approved Repo
+Read-only tool allowlist
+Lease expiry
+Revoke state
+Search scope restrictions
+```
+
+وجود MCP Server یا PAT پشت Runtime هرگز به‌تنهایی مجوز Read نیست.
+
+### Secure Bootstrap
+
+MCP config و GitHub credential نباید برای Secure Runtime به‌صورت bind-mounted فایل معمولی یا Docker command argument منتقل شوند.
+
+روش فعلی:
+
+```text
+Host config.json
+Host github.env
+      ↓ stdin stream
+Container-only tmpfs /run/bootstrap
+      ↓
+config.json + github.env with umask 077
+      ↓
+Secure Runtime starts
+```
+
+هدف:
+
+```text
+PAT not in model context
+PAT not in MCP tool args/results
+PAT not in Docker command arguments
+PAT not in docker inspect environment
+PAT not bind-mounted from host
+Bootstrap files exist only in container tmpfs
+```
+
+Secure Runtime با hardening زیر اجرا می‌شود:
+
+```text
+--cap-drop ALL
+--security-opt no-new-privileges
+container-only tmpfs for bootstrap secrets
+no host publish for PAT-bearing upstream
+```
+
+Docker socket فقط برای اجرای GitHub MCP stdio container توسط MCP Proxy داخل Runtime در دسترس است؛ این موضوع نباید باعث publish شدن Proxy یا ایجاد یک مسیر GitHub Read خارج از Capability Gateway شود.
+
+### Fail-Closed Network Invariant
+
+Runtime صحیح روی Host باید این وضعیت را داشته باشد:
+
+```text
+127.0.0.1:38106 LISTEN ✅
+38107 host LISTEN ❌
+38108 host LISTEN ❌
+```
+
+و درخواست مستقیم به Front Door بدون Extension credential / Capability معتبر باید قبل از GitHub رد شود:
+
+```text
+PAT exists ✅
+MCP runtime exists ✅
+Extension capability missing ❌
+→ HTTP 401/403
+→ NO NEW GITHUB DATA
+```
+
+بنابراین تغییر از `localhost` به `127.0.0.1` صرفاً تغییر نام Host نیست؛ بخشی از Binding صریح Security Boundary و توپولوژی Secure Local MCP Runtime است.
+
+---
+
 ## 25. Extension Requirement
 
 اگر مهاجم Conversation را روی دستگاه دیگری باز کند:
@@ -1011,9 +1146,34 @@ GitHub Read = DENY
 
 ---
 
+## J. Secure Host Binding / No Direct Upstream
+
+روی Host:
+
+```text
+127.0.0.1:38106 LISTEN
+38107 not published
+38108 not published
+```
+
+یک MCP `tools/call` مستقیم به `http://127.0.0.1:38106/mcp` بدون Extension device credential یا Lease معتبر:
+
+```text
+↓
+401/403
+↓
+No GitHub read
+```
+
+**Expected:** PASS
+
+---
+
 # Final SSOT Rule
 
 > **هیچ GitHub Read جدیدی صرفاً به‌خاطر حضور مدل در یک Conversation، وجود یک Session قبلی، داشتن PAT در Proxy یا باقی‌ماندن زمان Approval قبلی مجاز نیست. هر دسترسی باید به Repo، Origin، Prompt/UserTurn واقعی کاربر و Time Window تأییدشده متصل باشد.**
+>
+> **MCP همچنان Transport / Tool Execution Mechanism این Flow است. Endpoint رسمی Extension روی Host، `http://127.0.0.1:38106/mcp` با `Streamable HTTP` است و فقط همین Front Door روی Host publish می‌شود؛ PAT-bearing MCP Proxy و Gateway داخلی نباید مستقیم روی Host publish شوند.**
 >
 > **داخل همان UserPrompt/ReviewJob، مدل باید بتواند بدون Approval مجدد در تمام Repo حرکت Read-only داشته باشد تا بررسی‌های معماری، Audit و E2E ناقص نشوند.**
 >
