@@ -28,6 +28,7 @@ const READ_TOOL_NAMES = new Set([
 const READ_TOOL_PATTERN = /###\s+(get_me|get_file_contents|get_repository_tree|search_code|list_commits|get_commit|get_file_blame|list_branches|list_tags|get_tag|list_pull_requests|pull_request_read)\b/;
 
 interface PendingReviewRequest {
+  requestId?: string;
   id?: string;
   owner?: string;
   repo?: string;
@@ -53,6 +54,7 @@ interface ReviewStatusResponse {
   success?: boolean;
   currentTabId?: number;
   session?: ReviewSession | null;
+  originSession?: ReviewSession | null;
   pendingRequests?: PendingReviewRequest[];
   pendingRequest?: PendingReviewRequest | null;
 }
@@ -70,6 +72,18 @@ interface ReviewAuditEntry {
 interface ReviewAuditResponse {
   success?: boolean;
   entries?: ReviewAuditEntry[];
+}
+
+interface McpToolCallResponse {
+  success?: boolean;
+  error?: string;
+  payload?: {
+    pendingApproval?: boolean;
+    requestId?: string;
+    owner?: string;
+    repo?: string;
+    durationMinutes?: number;
+  };
 }
 
 type ResumeAttempt = { count: number; nextAt: number };
@@ -103,6 +117,10 @@ function containsReviewRequestCall(text: string): boolean {
   return parseJsonObjects(text).some(
     item => item?.type === 'function_call_start' && item?.name === REVIEW_REQUEST_TOOL,
   );
+}
+
+function pendingRequestId(request: PendingReviewRequest): string | undefined {
+  return request.requestId || request.id;
 }
 
 function findRenderedReviewBlocks(owner?: string, repo?: string): HTMLElement[] {
@@ -178,9 +196,10 @@ function clearReviewRequestExecutionMemory(): void {
 }
 
 function surfacePendingReviewRequest(request: PendingReviewRequest): void {
-  if (!request.id || surfacedPendingRequestIds.has(request.id)) return;
+  const requestId = pendingRequestId(request);
+  if (!requestId || surfacedPendingRequestIds.has(requestId)) return;
 
-  surfacedPendingRequestIds.add(request.id);
+  surfacedPendingRequestIds.add(requestId);
   if (surfacedPendingRequestIds.size > 100) {
     const oldest = surfacedPendingRequestIds.values().next().value;
     if (oldest) surfacedPendingRequestIds.delete(oldest);
@@ -191,7 +210,7 @@ function surfacePendingReviewRequest(request: PendingReviewRequest): void {
   const duration = Number(request.durationMinutes) || 0;
 
   emitSecurityToast({
-    id: `pending-review:${request.id}`,
+    id: `pending-review:${requestId}`,
     title: 'تأیید Code Review لازم است',
     message: `${owner}/${repo}${duration ? ` — ${duration} دقیقه` : ''}`,
     variant: 'warning',
@@ -423,13 +442,57 @@ export function HeadlessInstructionSync() {
       }
     };
 
+    const executeObservedReviewRequest = async (source: HTMLElement) => {
+      if (disposed) return;
+
+      source.setAttribute('data-review-request-executing', 'true');
+      try {
+        const response = (await chrome.runtime.sendMessage({
+          type: 'mcp:call-tool',
+          payload: {
+            toolName: REVIEW_REQUEST_TOOL,
+            args: {},
+            adapterName: window.location.hostname || 'chat',
+          },
+          origin: 'content',
+          timestamp: Date.now(),
+        })) as McpToolCallResponse;
+
+        if (!response?.success) {
+          throw new Error(response?.error || 'ایجاد درخواست دسترسی Code Review ناموفق بود.');
+        }
+
+        source.setAttribute('data-review-request-executed', 'true');
+        window.dispatchEvent(new CustomEvent('code-review:pending-updated'));
+        void syncApprovalState();
+      } catch (error) {
+        source.setAttribute('data-review-request-execution-error', 'true');
+        emitSecurityToast({
+          id: `review-request-execution-failed:${Date.now()}`,
+          title: 'ایجاد درخواست Code Review ناموفق بود',
+          message: error instanceof Error ? error.message : String(error),
+          variant: 'error',
+          durationMs: 7000,
+        });
+      } finally {
+        source.removeAttribute('data-review-request-executing');
+      }
+    };
+
     const scan = () => {
       if (disposed) return;
       document.querySelectorAll<HTMLElement>('pre').forEach(source => {
         if (source.getAttribute('data-review-request-observed') === 'true') return;
         if (source.closest('.function-block')) return;
         if (!containsReviewRequestCall(source.textContent || '')) return;
+
+        // In MCP SuperAssistant a model "tool call" is emitted into the chat DOM
+        // and then executed locally by the extension. The access-request tool is a
+        // special security primitive: executing it performs no GitHub I/O and only
+        // creates the explicit user-approval Pending Request. Therefore it must not
+        // depend on the user's general Auto Execute preference.
         source.setAttribute('data-review-request-observed', 'true');
+        void executeObservedReviewRequest(source);
       });
     };
 
@@ -448,14 +511,14 @@ export function HeadlessInstructionSync() {
           : response.pendingRequest
             ? [response.pendingRequest]
             : [];
-        const session = response.session || null;
+        const originSession = response.originSession || null;
         const currentTabId = response.currentTabId;
         const path = currentConversationPath();
 
-        // The approval-request tool is intentionally repeatable. Once there is no
-        // active/pending review, forget its in-memory auto-execution signature so a
-        // later model call in the same conversation can create a fresh request.
-        if (!session && pendingRequests.length === 0) {
+        // The approval-request tool is intentionally repeatable. Once this origin
+        // has no active/pending review, forget its in-memory auto-execution signature
+        // so a later real model call can create a fresh request.
+        if (!originSession && pendingRequests.length === 0) {
           clearReviewRequestExecutionMemory();
         }
 
@@ -467,44 +530,36 @@ export function HeadlessInstructionSync() {
           surfacePendingReviewRequest(currentPending);
         }
 
-        if (session && (session.approvedTabId === currentTabId || session.sourcePath === path)) {
-          setRenderedReviewState(session, 'approved');
+        if (originSession) {
+          setRenderedReviewState(originSession, 'approved');
         }
 
-        const sessionId = session?.id || null;
+        const sessionId = originSession?.id || null;
         const sessionChanged = lastSessionId.current === undefined || lastSessionId.current !== sessionId;
         lastSessionId.current = sessionId;
 
         const currentTools = toolsRef.current;
         const hasReadTools = currentTools.some(tool => READ_TOOL_NAMES.has(tool.name));
         const hasRequestTool = currentTools.some(tool => tool.name === REVIEW_REQUEST_TOOL);
-        const sessionIsForThisTab = Boolean(
-          session && currentTabId !== undefined && session.approvedTabId === currentTabId,
-        );
-
         let refreshedTools: Array<{ name?: string }> | undefined;
 
-        if (session && !sessionIsForThisTab) {
-          if (currentTools.length > 0) {
-            setAvailableTools([]);
-            toolsRef.current = [];
-          }
-        } else {
-          const toolScopeMismatch = session ? !hasReadTools : !hasRequestTool;
-          if (sessionChanged || toolScopeMismatch) {
-            try {
-              refreshedTools = await refreshTools(true);
-            } catch (error) {
-              logger.debug(
-                '[HeadlessInstructionSync] Gated tool refresh failed:',
-                error instanceof Error ? error.message : String(error),
-              );
-            }
+        // Capability is strictly origin-scoped. A session that belongs to another
+        // chat may be globally visible in the UI, but it must never cause this tab
+        // to receive or lose the wrong tool set.
+        const toolScopeMismatch = originSession ? !hasReadTools : !hasRequestTool;
+        if (sessionChanged || toolScopeMismatch) {
+          try {
+            refreshedTools = await refreshTools(true);
+          } catch (error) {
+            logger.debug(
+              '[HeadlessInstructionSync] Gated tool refresh failed:',
+              error instanceof Error ? error.message : String(error),
+            );
           }
         }
 
-        if (session && sessionIsForThisTab) {
-          await maybeResumeOriginSession(session, currentTabId, refreshedTools);
+        if (originSession) {
+          await maybeResumeOriginSession(originSession, currentTabId, refreshedTools);
         }
       } catch (error) {
         logger.debug(
