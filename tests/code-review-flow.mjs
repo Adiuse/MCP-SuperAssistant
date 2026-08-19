@@ -102,8 +102,21 @@ async function runOriginIsolationFlow(gate, storage) {
   const CHAT_A = 101;
   const CHAT_B = 202;
   const URL_A = 'https://chatgpt.com/c/code-review-a';
+  const URL_A_QUERY = 'https://chatgpt.com/c/code-review-a?model=gpt-5#composer';
   const URL_B = 'https://chatgpt.com/c/code-review-b';
   const sourcePathA = gate.sourcePathFromUrl(URL_A);
+
+  assert.equal(sourcePathA, '/c/code-review-a');
+  assert.equal(
+    gate.sourcePathFromUrl(URL_A_QUERY),
+    sourcePathA,
+    'query/hash changes must not create a different conversation origin',
+  );
+  assert.equal(
+    gate.sourcePathFromUrl('/c/code-review-a?model=gpt-5#composer'),
+    sourcePathA,
+    'already-relative conversation paths must also drop query/hash state',
+  );
 
   await gate.saveCodeReviewPreferences({
     owner: 'Adiuse',
@@ -160,11 +173,17 @@ async function runOriginIsolationFlow(gate, storage) {
   assert.equal((await gate.getPendingCodeReviewRequests()).length, 0);
 
   const chatASession = await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A);
+  const chatAQuerySession = await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A_QUERY);
   const chatBSession = await gate.getActiveCodeReviewSessionForOrigin(CHAT_B, URL_B);
   assert.equal(chatASession?.id, session.id);
+  assert.equal(
+    chatAQuerySession?.id,
+    session.id,
+    'same tab/conversation must retain access when only URL query/hash changes',
+  );
   assert.equal(chatBSession, null);
 
-  const chatATools = await gate.filterCodeReviewTools(serverTools, CHAT_A, URL_A);
+  const chatATools = await gate.filterCodeReviewTools(serverTools, CHAT_A, URL_A_QUERY);
   const chatBTools = await gate.filterCodeReviewTools(serverTools, CHAT_B, URL_B);
 
   assert.deepEqual(
@@ -180,7 +199,7 @@ async function runOriginIsolationFlow(gate, storage) {
     'get_file_contents',
     { owner: 'Adiuse', repo: 'cybersecurity', path: 'README.md' },
     CHAT_A,
-    URL_A,
+    URL_A_QUERY,
   );
   assert.equal(authorized.sessionId, session.id);
   assert.equal(authorized.args.owner, 'Adiuse');
@@ -192,7 +211,7 @@ async function runOriginIsolationFlow(gate, storage) {
     { content: '# README' },
     authorized.sessionId,
     CHAT_A,
-    URL_A,
+    URL_A_QUERY,
   );
   assert.deepEqual(result, { content: '# README' });
 
@@ -213,15 +232,15 @@ async function runOriginIsolationFlow(gate, storage) {
         'get_file_contents',
         { owner: 'OtherOwner', repo: 'other-repo', path: 'README.md' },
         CHAT_A,
-        URL_A,
+        URL_A_QUERY,
       ),
     /scope violation/i,
   );
 
   const expired = await gate.expireCodeReviewSession(session.id);
   assert.equal(expired?.id, session.id);
-  assert.equal(await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A), null);
-  assert.deepEqual(await gate.filterCodeReviewTools(serverTools, CHAT_A, URL_A), []);
+  assert.equal(await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A_QUERY), null);
+  assert.deepEqual(await gate.filterCodeReviewTools(serverTools, CHAT_A, URL_A_QUERY), []);
 
   const audit = await gate.getCodeReviewAuditLog();
   const actions = new Set(audit.map(entry => entry.action));
@@ -340,7 +359,7 @@ globalThis.chrome = {
 const gate = await loadGate();
 
 await runOriginIsolationFlow(gate, storage);
-console.log('✓ Chat A request → Chat B approve → GitHub read tools only in Chat A → expiry removes access');
+console.log('✓ Chat A request → Chat B approve → query-insensitive origin retains read tools → expiry removes access');
 
 await runRequestIdQueueFlow(gate, storage);
 console.log('✓ Global pending queue approval targets the selected requestId, not the first request');
