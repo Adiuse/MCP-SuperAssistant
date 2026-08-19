@@ -28,3 +28,5 @@ jobs:
         run: pnpm --filter chrome-extension type-check
       - name: Run Code Review isolation and expiry flow
         run: pnpm exec node tests/code-review-flow.mjs
+      - name: Run Code Review DOM request contract
+        run: pnpm exec node tests/code-review-dom-request-contract.mjs
