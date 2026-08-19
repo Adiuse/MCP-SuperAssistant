@@ -12,16 +12,20 @@ import { WebSocketTransport } from './plugins/websocket/WebSocketTransport.js';
 import { DEFAULT_CLIENT_CONFIG } from './types/config.js';
 import { createLogger } from '@extension/shared/lib/logger';
 import {
+  CODE_REVIEW_ALLOWED_TOOLS,
   CODE_REVIEW_REQUEST_TOOL_NAME,
   authorizeCodeReviewToolCall,
   createPendingCodeReviewRequest,
   enforceCodeReviewResultPolicy,
-  filterCodeReviewTools,
-  getActiveCodeReviewSession,
+  getActiveCodeReviewSessionForOrigin,
   getCodeReviewRequestTool,
   getPendingCodeReviewRequests,
   recordCodeReviewAuditEvent,
 } from '../security/codeReviewGate.js';
+import {
+  aliasScopedTools,
+  resolveScopedServerToolName,
+} from '../security/codeReviewToolAlias.js';
 import { notifyCodeReviewAccessRequested } from '../security/codeReviewNotifications.js';
 import {
   consumeCodeReviewCallerContext,
@@ -122,10 +126,23 @@ function safeSourcePath(url?: string): string | undefined {
   if (!url) return undefined;
   try {
     const parsed = new URL(url);
-    return `${parsed.pathname}${parsed.search}`.slice(0, 500);
+    // Conversation identity is carried by the pathname. Query-string changes
+    // must not invalidate an already-approved origin within the same tab/chat.
+    return parsed.pathname.slice(0, 500);
   } catch {
     return undefined;
   }
+}
+
+function summarizeRawToolNames(tools: Array<{ name?: string }>): string {
+  const names = tools
+    .map(tool => String(tool?.name || '').trim())
+    .filter(Boolean)
+    .slice(0, 24);
+
+  if (names.length === 0) return '(none)';
+  const suffix = tools.length > names.length ? ` … +${tools.length - names.length} more` : '';
+  return `${names.join(', ')}${suffix}`;
 }
 
 async function executeGatedToolCall(
@@ -159,7 +176,7 @@ async function executeGatedToolCall(
             : `tab:${effectiveCallerTabId}`,
     });
 
-    const wasAlreadyPending = pendingBefore.some(item => item.id === request.id);
+    const wasAlreadyPending = pendingBefore.some(item => item.requestId === request.requestId);
     if (!wasAlreadyPending) {
       const sent = await notifyCodeReviewAccessRequested(
         request.owner,
@@ -184,46 +201,79 @@ async function executeGatedToolCall(
         },
       ],
       pendingApproval: true,
-      requestId: request.id,
+      requestId: request.requestId,
       owner: request.owner,
       repo: request.repo,
       durationMinutes: request.durationMinutes,
     };
   }
 
-  // There is deliberately no "use the approved tab as the caller" fallback.
-  // A real tab id must be supplied directly or recovered from the trusted
-  // runtime-message capture above, otherwise the gate denies the operation.
-  const sanitizedArgs = await authorizeCodeReviewToolCall(
+  // Gate authorization always uses the canonical model-visible tool name.
+  const authorization = await authorizeCodeReviewToolCall(
     toolName,
     args || {},
     effectiveCallerTabId,
+    effectiveSourceUrl,
   );
-  const result = await client.callTool(toolName, sanitizedArgs, adapterName);
-  return await enforceCodeReviewResultPolicy(toolName, result);
+
+  // MCP SuperAssistant Proxy may namespace tools when aggregating servers.
+  // Resolve the canonical approved alias back to the exact server tool only
+  // after the Gate has authorized the call.
+  const primitives = await client.getPrimitives(false);
+  const serverToolName = resolveScopedServerToolName(
+    primitives.tools,
+    toolName,
+    CODE_REVIEW_ALLOWED_TOOLS,
+  );
+
+  const result = await client.callTool(serverToolName, authorization.args, adapterName);
+  return await enforceCodeReviewResultPolicy(
+    toolName,
+    result,
+    authorization.sessionId,
+    effectiveCallerTabId,
+    effectiveSourceUrl,
+  );
 }
 
 async function getGatedPrimitives(
   client: McpClient,
   forceRefresh: boolean,
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any[]> {
-  const session = await getActiveCodeReviewSession();
+  // Never expose an operational tool set to an unscoped/background caller.
+  // Tool discovery for a chat must always carry the trusted sender tab/url.
+  if (callerTabId === undefined) return [];
+
+  const session = await getActiveCodeReviewSessionForOrigin(callerTabId, callerSourceUrl);
 
   if (!session) {
     return [{ type: 'tool', value: await getCodeReviewRequestTool() }];
   }
 
-  // New callers can request a tab-scoped list. Legacy background broadcasts do
-  // not carry a tab id yet, so they receive the allowlisted read set; the
-  // content-side security synchronizer hides that set from every non-origin tab.
-  // Execution itself remains strictly tab-gated above.
-  if (callerTabId !== undefined && callerTabId !== session.approvedTabId) {
-    return [];
+  const response = await client.getPrimitives(forceRefresh);
+  const tools = aliasScopedTools(response.tools, CODE_REVIEW_ALLOWED_TOOLS);
+
+  if (tools.length === 0) {
+    const rawNames = summarizeRawToolNames(response.tools);
+    const reason =
+      response.tools.length === 0
+        ? 'MCP server returned zero tools after Code Review approval. Ensure the configured github-review MCP server is running and exposed through the proxy.'
+        : `MCP server returned ${response.tools.length} raw tool(s), but none matched the approved GitHub read-only aliases. Raw names: ${rawNames}`;
+
+    logger.warn(`[CodeReview] ${reason}`);
+    throw new Error(reason);
   }
 
-  const response = await client.getPrimitives(forceRefresh);
-  const tools = await filterCodeReviewTools(response.tools);
+  logger.debug(
+    `[CodeReview] Exposing ${tools.length} approved GitHub read tool(s) for origin tab ${callerTabId}: ${tools
+      .map(tool => tool.name)
+      .join(', ')}`,
+  );
+
+  // The model sees only canonical allowlisted names even when the proxy uses a
+  // server namespace. No write/unapproved tool descriptor crosses this boundary.
   return tools.map(tool => ({ type: 'tool', value: tool }));
 }
 
@@ -270,12 +320,13 @@ export async function getPrimitivesWithBackwardsCompatibility(
   forceRefresh: boolean = false,
   transportType?: import('./types/plugin.js').TransportType,
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any[]> {
   const client = await getGlobalClient();
   const type = transportType || detectTransportType(uri);
 
   if (!client.isConnected()) await client.connect({ uri, type });
-  return await getGatedPrimitives(client, forceRefresh, callerTabId);
+  return await getGatedPrimitives(client, forceRefresh, callerTabId, callerSourceUrl);
 }
 
 export async function forceReconnectToMcpServer(
@@ -359,10 +410,11 @@ export async function getPrimitivesWithWebSocket(
   uri: string,
   forceRefresh: boolean = false,
   callerTabId?: number,
+  callerSourceUrl?: string,
 ): Promise<any[]> {
   const client = await getGlobalClient();
   await client.connect({ uri, type: 'websocket' });
-  return await getGatedPrimitives(client, forceRefresh, callerTabId);
+  return await getGatedPrimitives(client, forceRefresh, callerTabId, callerSourceUrl);
 }
 
 export function normalizeToolsFromPrimitives(primitives: any[]): any[] {

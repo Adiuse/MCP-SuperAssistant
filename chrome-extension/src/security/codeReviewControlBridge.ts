@@ -1,8 +1,10 @@
 import {
   CODE_REVIEW_ALLOWED_DURATIONS,
   clearCodeReviewAuditLog,
-  createPendingCodeReviewRequest,
+  expireCodeReviewSession,
   getActiveCodeReviewSession,
+  getActiveCodeReviewSessionForOrigin,
+  getActiveCodeReviewSessions,
   getCodeReviewAuditLog,
   getCodeReviewPreferences,
   getPendingCodeReviewRequests,
@@ -14,7 +16,6 @@ import {
 } from './codeReviewGate.js';
 import {
   clearCodeReviewExpiryNotification,
-  notifyCodeReviewAccessRequested,
   notifyCodeReviewRevoked,
   notifyCodeReviewStarted,
   registerCodeReviewNotificationListeners,
@@ -46,6 +47,7 @@ export interface CodeReviewCallerContext {
 
 let bridgeRegistered = false;
 const callerContextQueues = new Map<string, CodeReviewCallerContext[]>();
+const toolListCallerContexts: CodeReviewCallerContext[] = [];
 
 function stableSerialize(value: unknown): string {
   if (value === null || typeof value !== 'object') {
@@ -79,13 +81,24 @@ function pruneCallerContexts(): void {
     total += fresh.length;
   }
 
+  while (toolListCallerContexts.length > 0 && toolListCallerContexts[0].capturedAt < cutoff) {
+    toolListCallerContexts.shift();
+  }
+  total += toolListCallerContexts.length;
+
   if (total <= MAX_CALLER_CONTEXTS) return;
 
-  const all = [...callerContextQueues.entries()]
+  const allToolCalls = [...callerContextQueues.entries()]
     .flatMap(([key, queue]) => queue.map(item => ({ key, item })))
     .sort((a, b) => a.item.capturedAt - b.item.capturedAt);
 
-  for (const entry of all.slice(0, total - MAX_CALLER_CONTEXTS)) {
+  let removeCount = total - MAX_CALLER_CONTEXTS;
+  while (removeCount > 0 && toolListCallerContexts.length > 0) {
+    toolListCallerContexts.shift();
+    removeCount--;
+  }
+
+  for (const entry of allToolCalls.slice(0, removeCount)) {
     const queue = callerContextQueues.get(entry.key);
     if (!queue) continue;
     const index = queue.indexOf(entry.item);
@@ -109,6 +122,14 @@ function captureCodeReviewCallerContext(
   callerContextQueues.set(key, queue);
 }
 
+function captureCodeReviewToolListCallerContext(sender: chrome.runtime.MessageSender): void {
+  const tabId = sender.tab?.id;
+  if (tabId === undefined) return;
+
+  pruneCallerContexts();
+  toolListCallerContexts.push({ tabId, sourceUrl: sender.tab?.url, capturedAt: Date.now() });
+}
+
 export function consumeCodeReviewCallerContext(
   toolName: string,
   args: unknown,
@@ -121,6 +142,11 @@ export function consumeCodeReviewCallerContext(
   const context = queue.shift() || null;
   if (queue.length === 0) callerContextQueues.delete(key);
   return context;
+}
+
+export function consumeCodeReviewToolListCallerContext(): CodeReviewCallerContext | null {
+  pruneCallerContexts();
+  return toolListCallerContexts.shift() || null;
 }
 
 function readSettingsPayload(message: any): { owner: string; repo: string; durationMinutes: number } {
@@ -142,6 +168,11 @@ function readRequestId(message: any): string {
   return requestId;
 }
 
+function readOptionalSessionId(message: any): string | undefined {
+  const sessionId = typeof message.payload?.sessionId === 'string' ? message.payload.sessionId.trim() : '';
+  return sessionId || undefined;
+}
+
 function safeSourcePath(url?: string): string | undefined {
   if (!url) return undefined;
   try {
@@ -150,6 +181,16 @@ function safeSourcePath(url?: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function exposePendingRequest<T extends { requestId: string }>(request: T): T & { id: string } {
+  // `id` is a temporary presentation compatibility alias for older content UI.
+  // All control actions still carry the authoritative requestId in payload.requestId.
+  return { ...request, id: request.requestId };
+}
+
+function exposePendingRequests<T extends { requestId: string }>(requests: T[]): Array<T & { id: string }> {
+  return requests.map(exposePendingRequest);
 }
 
 async function auditNotificationResult(input: {
@@ -176,14 +217,12 @@ export function registerCodeReviewControlBridge(): void {
   bridgeRegistered = true;
 
   registerCodeReviewNotificationListeners(async event => {
-    await recordCodeReviewAuditEvent({
-      timestamp: Date.now(),
-      action: 'notification_sent',
-      sessionId: event.sessionId,
-      owner: event.owner,
-      repo: event.repo,
-      reason: 'session_expired',
-    });
+    // The alarm is authoritative for expiry. Remove the exact session immediately
+    // so subsequent tool discovery/execution cannot keep using stale access.
+    const expired = await expireCodeReviewSession(event.sessionId);
+    if (expired) {
+      logger.debug(`[CodeReviewControlBridge] Expired session ${event.sessionId} for ${expired.owner}/${expired.repo}`);
+    }
   });
 
   chrome.runtime.onMessage.addListener((message: any, sender, sendResponse) => {
@@ -195,23 +234,35 @@ export function registerCodeReviewControlBridge(): void {
       return false;
     }
 
+    if (message?.type === 'mcp:get-tools') {
+      captureCodeReviewToolListCallerContext(sender);
+      return false;
+    }
+
     if (!message || typeof message.type !== 'string' || !message.type.startsWith('code-review:')) return false;
 
     const run = async () => {
       switch (message.type) {
         case CODE_REVIEW_CONTROL_MESSAGES.STATUS: {
-          const [session, pendingRequests, settings] = await Promise.all([
+          const tabId = sender.tab?.id;
+          const sourceUrl = sender.tab?.url;
+          const [originSession, fallbackSession, sessions, pendingRequests, settings] = await Promise.all([
+            getActiveCodeReviewSessionForOrigin(tabId, sourceUrl),
             getActiveCodeReviewSession(),
+            getActiveCodeReviewSessions(),
             getPendingCodeReviewRequests(),
             getCodeReviewPreferences(),
           ]);
+          const exposedPending = exposePendingRequests(pendingRequests);
           return {
             success: true,
-            currentTabId: sender.tab?.id,
-            session,
+            currentTabId: tabId,
+            session: originSession || fallbackSession,
+            originSession,
+            sessions,
             settings,
-            pendingRequests,
-            pendingRequest: pendingRequests[0] || null,
+            pendingRequests: exposedPending,
+            pendingRequest: exposedPending[0] || null,
           };
         }
 
@@ -227,30 +278,10 @@ export function registerCodeReviewControlBridge(): void {
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REQUEST: {
-          const tabId = sender.tab?.id;
-          if (tabId === undefined) throw new Error('درخواست دسترسی فقط از داخل تب مرورگر مجاز است.');
-
-          const sourcePath = safeSourcePath(sender.tab?.url);
-          const request = await createPendingCodeReviewRequest({
-            sourceTabId: tabId,
-            sourcePath,
-            sourceKey: sourcePath ? `${tabId}:${sourcePath}` : `tab:${tabId}`,
-          });
-
-          const sent = await notifyCodeReviewAccessRequested(
-            request.owner,
-            request.repo,
-            request.durationMinutes,
-          );
-          await auditNotificationResult({
-            sent,
-            owner: request.owner,
-            repo: request.repo,
-            tabId,
-            reason: 'access_requested',
-          });
-
-          return { success: true, currentTabId: tabId, pendingRequest: request };
+          // Pending requests must only be created by executing the dedicated MCP
+          // security tool in response to a real repository task. A control/UI
+          // message must not be able to manufacture an approval request.
+          throw new Error('درخواست دسترسی فقط از طریق ابزار request_code_review_access ایجاد می‌شود.');
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.APPROVE: {
@@ -259,15 +290,12 @@ export function registerCodeReviewControlBridge(): void {
           if (approvingTabId === undefined) throw new Error('تأیید دسترسی فقط از داخل تب مرورگر مجاز است.');
 
           const pendingRequests = await getPendingCodeReviewRequests();
-          const pending = pendingRequests.find(request => request.id === requestId);
+          const pending = pendingRequests.find(request => request.requestId === requestId);
           if (!pending) throw new Error('این درخواست دیگر در صف انتظار وجود ندارد.');
 
           const session = await startCodeReviewSession({
-            owner: pending.owner,
-            repo: pending.repo,
-            durationMinutes: pending.durationMinutes,
-            approvedTabId: approvingTabId,
-            requestId: pending.id,
+            requestId: pending.requestId,
+            approvingTabId,
           });
 
           await scheduleCodeReviewExpiryNotification({
@@ -287,7 +315,7 @@ export function registerCodeReviewControlBridge(): void {
             reason: 'session_started',
           });
 
-          const remaining = await getPendingCodeReviewRequests();
+          const remaining = exposePendingRequests(await getPendingCodeReviewRequests());
           return {
             success: true,
             currentTabId: approvingTabId,
@@ -298,42 +326,67 @@ export function registerCodeReviewControlBridge(): void {
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REJECT: {
-          if (sender.tab?.id === undefined) throw new Error('رد درخواست فقط از داخل تب مرورگر مجاز است.');
+          const actorTabId = sender.tab?.id;
+          if (actorTabId === undefined) throw new Error('رد درخواست فقط از داخل تب مرورگر مجاز است.');
           const requestId = readRequestId(message);
-          const rejected = await rejectPendingCodeReviewRequest('explicitly rejected by user', requestId);
+          const rejected = await rejectPendingCodeReviewRequest(
+            requestId,
+            'explicitly rejected by user',
+            actorTabId,
+          );
           if (!rejected) throw new Error('این درخواست دیگر در صف انتظار وجود ندارد.');
-          const remaining = await getPendingCodeReviewRequests();
+          const remaining = exposePendingRequests(await getPendingCodeReviewRequests());
           return {
             success: true,
-            currentTabId: sender.tab.id,
+            currentTabId: actorTabId,
             pendingRequests: remaining,
             pendingRequest: remaining[0] || null,
-            rejected,
+            rejected: exposePendingRequest(rejected),
           };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REVOKE: {
-          if (sender.tab?.id === undefined) throw new Error('لغو دسترسی فقط از داخل تب مرورگر مجاز است.');
+          const actorTabId = sender.tab?.id;
+          if (actorTabId === undefined) throw new Error('لغو دسترسی فقط از داخل تب مرورگر مجاز است.');
 
-          const revoked = await revokeCodeReviewSession('manual global revoke from Persian Code Review UI');
-          await clearCodeReviewExpiryNotification();
-          const sent = await notifyCodeReviewRevoked(revoked?.owner, revoked?.repo);
+          const requestedSessionId = readOptionalSessionId(message);
+          const sessions = await getActiveCodeReviewSessions();
+          const originSession = await getActiveCodeReviewSessionForOrigin(actorTabId, sender.tab?.url);
+          const target = requestedSessionId
+            ? sessions.find(item => item.id === requestedSessionId) || null
+            : originSession || sessions[0] || null;
+
+          if (!target) throw new Error('نشست فعال Code Review برای لغو وجود ندارد.');
+
+          const revoked = await revokeCodeReviewSession(
+            target.id,
+            'manual revoke from Code Review security UI',
+            actorTabId,
+          );
+          if (!revoked) throw new Error('نشست انتخاب‌شده دیگر فعال نیست.');
+
+          await clearCodeReviewExpiryNotification(revoked.id);
+          const sent = await notifyCodeReviewRevoked(revoked.owner, revoked.repo);
           await auditNotificationResult({
             sent,
-            sessionId: revoked?.id,
-            owner: revoked?.owner,
-            repo: revoked?.repo,
-            tabId: sender.tab.id,
+            sessionId: revoked.id,
+            owner: revoked.owner,
+            repo: revoked.repo,
+            tabId: actorTabId,
             reason: 'session_revoked',
           });
 
-          const pendingRequests = await getPendingCodeReviewRequests();
+          const pendingRequests = exposePendingRequests(await getPendingCodeReviewRequests());
+          const remainingSessions = await getActiveCodeReviewSessions();
+          const nextOriginSession = await getActiveCodeReviewSessionForOrigin(actorTabId, sender.tab?.url);
           return {
             success: true,
-            currentTabId: sender.tab.id,
-            session: null,
+            currentTabId: actorTabId,
+            session: nextOriginSession || remainingSessions[0] || null,
+            sessions: remainingSessions,
             pendingRequests,
             pendingRequest: pendingRequests[0] || null,
+            revoked,
           };
         }
 

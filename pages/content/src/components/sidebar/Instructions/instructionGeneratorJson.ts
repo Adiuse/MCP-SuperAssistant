@@ -11,6 +11,21 @@ type JsonSchema = {
   additionalProperties?: boolean;
 };
 
+const CODE_REVIEW_READ_TOOL_NAMES = new Set([
+  'get_me',
+  'get_file_contents',
+  'get_repository_tree',
+  'search_code',
+  'list_commits',
+  'get_commit',
+  'get_file_blame',
+  'list_branches',
+  'list_tags',
+  'get_tag',
+  'list_pull_requests',
+  'pull_request_read',
+]);
+
 function parseSchema(schemaText: string): JsonSchema {
   try {
     const parsed = JSON.parse(schemaText || '{}');
@@ -47,6 +62,42 @@ function renderTool(tool: InstructionTool): string {
     .join('\n');
 }
 
+function isActiveCodeReviewToolset(tools: InstructionTool[]): boolean {
+  return (
+    tools.length > 0 &&
+    tools.some(tool => CODE_REVIEW_READ_TOOL_NAMES.has(tool.name)) &&
+    tools.every(tool => CODE_REVIEW_READ_TOOL_NAMES.has(tool.name))
+  );
+}
+
+function generateActiveCodeReviewInstructions(toolList: string): string {
+  return `[MCP Code Review Session Active][IMPORTANT]
+
+The user's explicit Code Review approval is active. Continue the repository task that was pending before approval using only the read-only MCP tools below. Do not request access again while this session remains active.
+
+Rules:
+1. When a tool is needed, emit exactly ONE function call and then STOP.
+2. Do NOT use ChatGPT connectors, browsing, Python, or invented tools as a substitute for these MCP tools.
+3. Never invent tool names or parameter values. The repository scope is enforced by the extension.
+4. After a function call, wait for the extension-provided \`<function_result>\` before continuing.
+5. Never fabricate a function result.
+
+Required JSONL call format:
+\`\`\`text
+{"type":"function_call_start","name":FUNCTION_NAME_JSON_STRING,"call_id":1}
+{"type":"description","text":"Short description of the requested action"}
+{"type":"parameter","key":PARAMETER_NAME_JSON_STRING,"value":PARAMETER_VALUE_JSON}
+{"type":"function_call_end","call_id":1}
+\`\`\`
+The template is intentionally not valid JSON until placeholders are replaced. Use zero \`parameter\` lines for tools that say \`Parameters: none\`.
+
+## Active read-only MCP tools
+
+${toolList}
+
+Continue the user's already-pending repository task now. The extension will execute valid calls and return the actual result to this conversation.`;
+}
+
 /**
  * Generates the instruction block injected/attached to the chat so the model
  * can emit MCP function calls in the exact JSONL format understood by the
@@ -68,6 +119,16 @@ export const generateInstructionsJson = (
   }
 
   const toolList = tools.map(renderTool).join('\n\n');
+
+  // Approval changes the exposed tool set from the single request primitive to
+  // the read-only GitHub tools. HeadlessInstructionSync must send that new tool
+  // schema to the model to resume the pending task, but repeating the entire
+  // initial MCP instruction block creates a second giant visible user message.
+  // Use a small approval continuation for the active Code Review toolset.
+  if (isActiveCodeReviewToolset(tools)) {
+    return generateActiveCodeReviewInstructions(toolList);
+  }
+
   const custom =
     customInstructionsEnabled && customInstructions?.trim()
       ? `\n\n## Custom instructions\n${customInstructions.trim()}`
