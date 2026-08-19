@@ -180,10 +180,20 @@ function sanitizeTabId(value: unknown): number | undefined {
 
 export function sourcePathFromUrl(url?: string): string | undefined {
   if (!url) return undefined;
-  if (url.startsWith('/')) return sanitizeOptionalString(url, 500);
+  if (url.startsWith('/')) {
+    const queryIndex = url.indexOf('?');
+    const hashIndex = url.indexOf('#');
+    const cutAt = [queryIndex, hashIndex]
+      .filter(index => index >= 0)
+      .reduce((lowest, index) => Math.min(lowest, index), url.length);
+    return sanitizeOptionalString(url.slice(0, cutAt), 500);
+  }
   try {
     const parsed = new URL(url);
-    return sanitizeOptionalString(`${parsed.pathname}${parsed.search}`, 500);
+    // Conversation identity is the pathname (for example /c/<conversation-id>).
+    // Query/hash changes are presentation state and must not invalidate an
+    // already approved origin within the same browser tab/conversation.
+    return sanitizeOptionalString(parsed.pathname, 500);
   } catch {
     return undefined;
   }
