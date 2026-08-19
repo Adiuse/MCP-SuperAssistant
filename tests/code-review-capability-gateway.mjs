@@ -120,23 +120,33 @@ assert.doesNotMatch(
 );
 assert.doesNotMatch(
   launcher,
-  /src=\$\{GITHUB_ENV_PATH\},dst=\/run\/secrets\/github\.env/,
-  'GitHub credential file must not be bind-mounted into the secure runtime',
+  /src=\$\{(?:CONFIG_PATH|GITHUB_ENV_PATH)\}/,
+  'neither MCP config nor GitHub credential may be bind-mounted from the host into the capability runtime',
 );
 assert.match(
   launcher,
-  /--tmpfs "\/run\/secrets:rw,noexec,nosuid,nodev,mode=0700"/,
-  'GitHub credential must land only in a container-local tmpfs',
+  /--tmpfs "\/run\/bootstrap:rw,noexec,nosuid,nodev,mode=0700"/,
+  'MCP config and GitHub credential must land only in a container-local tmpfs bootstrap area',
 );
 assert.match(
   launcher,
-  /cat "\$GITHUB_ENV_PATH" \| exec docker run[\s\S]*cat > \/run\/secrets\/github\.env/,
-  'launcher must stream the GitHub credential over stdin into tmpfs so rootless Docker can consume a mode-0600 host secret without permission weakening',
+  /CONFIG_BYTES="\$\(wc -c < "\$CONFIG_PATH"[\s\S]*cat "\$CONFIG_PATH"[\s\S]*cat "\$GITHUB_ENV_PATH"[\s\S]*MCP_BOOTSTRAP_CONFIG_BYTES=\$\{CONFIG_BYTES\}[\s\S]*dd iflag=fullblock bs=1 count="\$MCP_BOOTSTRAP_CONFIG_BYTES" of=\/run\/bootstrap\/config\.json[\s\S]*cat > \/run\/bootstrap\/github\.env/,
+  'launcher must frame config by byte count and stream config + GitHub credential over stdin into container tmpfs',
 );
 assert.doesNotMatch(
   launcher,
   /--env(?:-file)?[^\n]*GITHUB/,
   'GitHub PAT must not be passed in Docker command arguments or container environment configuration',
+);
+assert.match(
+  entrypoint,
+  /CONFIG_PATH="\$\{MCP_SUPERASSISTANT_CONFIG:-\/run\/bootstrap\/config\.json\}"/,
+  'proxy config must default to the streamed container-tmpfs copy',
+);
+assert.match(
+  entrypoint,
+  /GITHUB_ENV_PATH="\$\{MCP_SUPERASSISTANT_GITHUB_ENV:-\/run\/bootstrap\/github\.env\}"/,
+  'GitHub credential must default to the streamed container-tmpfs copy',
 );
 assert.match(
   entrypoint,
@@ -166,4 +176,4 @@ assert.match(
 
 console.log('✓ Capability gateway requires an extension credential + active prompt-bound lease and re-enforces read-only repo scope');
 console.log('✓ PAT-bearing MCP proxy has no host-published port; host traffic can reach only the capability-gated front door');
-console.log('✓ GitHub credential is streamed into container tmpfs without weakening the host secret or exposing it in Docker config');
+console.log('✓ MCP config and GitHub credential are streamed into container tmpfs without host bind-mount permission weakening');
