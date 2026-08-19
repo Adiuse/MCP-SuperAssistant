@@ -17,31 +17,38 @@ const source = await fs.readFile(entry, 'utf8');
 assert.match(source, /response\.originSession/);
 assert.match(
   source,
-  /querySelector<HTMLButtonElement>\('\.execute-button'\)/,
-  'approved reads must trigger the renderer native Run button',
+  /window\.mcpClient/,
+  'approved reads must reuse the page MCP client used by the renderer',
 );
-assert.match(source, /executeButton\.click\(\)/);
 assert.match(
   source,
-  /querySelector<HTMLButtonElement>\('\.insert-result-button'\)/,
-  'approved read results must use the renderer native Insert button when Auto Insert is off',
+  /mcpClient\.callTool\(call\.toolName, call\.args\)/,
+  'approved reads must execute through the shared MCP client callTool API',
 );
-assert.match(source, /insertButton\.click\(\)/);
+assert.match(source, /await adapter\.insertText\(wrapper\)/);
 assert.match(source, /await adapter\.submitForm\(\)/);
+assert.match(source, /<function_result call_id=/);
 assert.match(
   source,
   /querySelectorAll<HTMLElement>\('\.function-block \.xml-results-panel pre'\)/,
-  'the security bridge may identify calls only from renderer-owned raw-info panels',
+  'the bridge may identify calls only from renderer-owned raw-info panels',
+);
+assert.match(source, /MAX_EXECUTION_ATTEMPTS\s*=\s*3/);
+assert.match(source, /data-code-review-read-final-error/);
+assert.doesNotMatch(
+  source,
+  /querySelector[^\n]*\.execute-button|executeButton\.click\(\)/,
+  'approved reads must not depend on locating or clicking the renderer Run button',
 );
 assert.doesNotMatch(
   source,
-  /MCP_CALL_MESSAGE|type:\s*['"]mcp:call-tool['"]|toolName:\s*call\.toolName/,
-  'approved reads must not directly call MCP from the security bridge',
+  /querySelector[^\n]*\.insert-result-button|insertButton\.click\(\)/,
+  'approved reads must not depend on locating or clicking the renderer Insert button',
 );
 assert.doesNotMatch(
   source,
-  /<function_result call_id=|insertText\(wrapper\)|resultToText/,
-  'the security bridge must not build or inject tool results itself',
+  /MCP_CALL_MESSAGE|type:\s*['"]mcp:call-tool['"]/,
+  'the bridge must not bypass the shared MCP client with a direct background tool call',
 );
 assert.doesNotMatch(source, /request_code_review_access/);
 
@@ -65,41 +72,17 @@ globalThis.window = {
 const mod = await import(`${pathToFileURL(outfile).href}?t=${Date.now()}`);
 const utils = mod.codeReviewReadExecutorTestUtils;
 
-window.__mcpAutomationState = { autoExecute: false, autoInsert: false, autoSubmit: false };
+window.__mcpAutomationState = { autoExecute: false };
 assert.equal(utils.generalAutoExecuteEnabled(), false);
-assert.deepEqual(utils.getAutomationState(), {
-  autoExecute: false,
-  autoInsert: false,
-  autoSubmit: false,
-  autoInsertDelay: 0,
-  autoSubmitDelay: 0,
-});
+assert.deepEqual(utils.getAutomationState(), { autoExecute: false });
 
-window.__mcpAutomationState = {
-  autoExecute: true,
-  autoInsert: true,
-  autoSubmit: true,
-  autoInsertDelay: 2,
-  autoSubmitDelay: 3,
-};
+window.__mcpAutomationState = { autoExecute: true };
 assert.equal(utils.generalAutoExecuteEnabled(), true);
-assert.deepEqual(utils.getAutomationState(), {
-  autoExecute: true,
-  autoInsert: true,
-  autoSubmit: true,
-  autoInsertDelay: 2,
-  autoSubmitDelay: 3,
-});
+assert.deepEqual(utils.getAutomationState(), { autoExecute: true });
 
 window.__mcpAutomationState = undefined;
-window.toggleState = { autoExecute: false, autoInsert: true, autoSubmit: false };
-assert.deepEqual(utils.getAutomationState(), {
-  autoExecute: false,
-  autoInsert: true,
-  autoSubmit: false,
-  autoInsertDelay: 0,
-  autoSubmitDelay: 0,
-});
+window.toggleState = { autoExecute: false };
+assert.deepEqual(utils.getAutomationState(), { autoExecute: false });
 window.toggleState = undefined;
 assert.equal(
   utils.generalAutoExecuteEnabled(),
@@ -142,4 +125,9 @@ assert.equal(
   null,
 );
 
-console.log('✓ Approved Code Review reads reuse the upstream Run/Insert pipeline and only add origin-scoped policy');
+assert.equal(
+  utils.resultToText({ content: [{ type: 'text', text: '# README' }] }),
+  '# README',
+);
+
+console.log('✓ Approved Code Review reads use the shared MCP client API without Run/Insert DOM coupling');
