@@ -34,9 +34,14 @@ assert.match(
   'the bridge may identify calls only from renderer-owned raw-info panels',
 );
 assert.match(source, /MAX_EXECUTION_ATTEMPTS\s*=\s*3/);
+assert.match(source, /MAX_RESULT_SUBMIT_ATTEMPTS\s*=\s*3/);
 assert.match(source, /data-code-review-read-final-error/);
 assert.match(source, /parseGitHubDeviceAuthChallenge\(result\)/);
 assert.match(source, /data-code-review-read-auth-required/);
+assert.match(source, /item\?\.type === 'resource'/);
+assert.match(source, /item\?\.resource\?\.text/);
+assert.match(source, /resultBySource\.set\(source, \{ key, result \}\)/);
+assert.match(source, /composerContainsResult\(call\.callId\)/);
 assert.match(
   source,
   /کد ورود برای امنیت به مدل ارسال نشد/,
@@ -137,6 +142,24 @@ assert.equal(
   '# README',
 );
 
+assert.equal(
+  utils.resultToText({
+    content: [
+      { type: 'text', text: 'successfully downloaded text file (SHA: abc123)' },
+      {
+        type: 'resource',
+        resource: {
+          uri: 'repo://Adiuse/cybersecurity/main/contents/README.md',
+          mimeType: 'text/plain; charset=utf-8',
+          text: '# Real README\n\nActual repository content.',
+        },
+      },
+    ],
+  }),
+  'successfully downloaded text file (SHA: abc123)\n\n# Real README\n\nActual repository content.',
+  'embedded MCP resource text from GitHub get_file_contents must reach the model',
+);
+
 const authChallengeText =
   'Visit https://github.com/login/device and enter the code 31FC-ADD4 to authorize the GitHub MCP Server. ' +
   'After authorizing, retry your request.';
@@ -152,4 +175,4 @@ assert.equal(
   null,
 );
 
-console.log('✓ Approved Code Review reads use the shared MCP client and keep GitHub auth challenges out of model context');
+console.log('✓ Approved Code Review reads preserve MCP resource text, verify result delivery, and keep GitHub auth challenges out of model context');
