@@ -16,6 +16,8 @@ const READ_TOOL_NAMES = new Set([
   'pull_request_read',
 ]);
 
+const MAX_EXECUTION_ATTEMPTS = 3;
+
 type ParsedReadCall = {
   toolName: string;
   callId: string;
@@ -34,10 +36,6 @@ type StatusResponse = {
 
 type AutomationState = {
   autoExecute: boolean;
-  autoInsert: boolean;
-  autoSubmit: boolean;
-  autoInsertDelay: number;
-  autoSubmitDelay: number;
 };
 
 declare global {
@@ -45,25 +43,24 @@ declare global {
     __mcpCodeReviewReadExecutorInstalled?: boolean;
     __mcpAutomationState?: {
       autoExecute?: boolean;
-      autoInsert?: boolean;
-      autoSubmit?: boolean;
-      autoInsertDelay?: number;
-      autoSubmitDelay?: number;
     };
     toggleState?: {
       autoExecute?: boolean;
-      autoInsert?: boolean;
-      autoSubmit?: boolean;
     };
     pluginRegistry?: any;
     mcpAdapter?: any;
     getCurrentAdapter?: () => any;
+    mcpClient?: {
+      isReady?: () => boolean;
+      callTool?: (toolName: string, args: Record<string, unknown>) => Promise<unknown>;
+    };
   }
 }
 
 const completedCalls = new Set<string>();
 const inFlightCalls = new Set<string>();
 const attemptsBySource = new WeakMap<HTMLElement, number>();
+const retryAfterBySource = new WeakMap<HTMLElement, number>();
 let observer: MutationObserver | null = null;
 let scanScheduled = false;
 let disposed = false;
@@ -82,31 +79,14 @@ function emitRuntimeToast(title: string, message: string, variant: 'info' | 'suc
   );
 }
 
-function numericDelay(value: unknown): number {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-}
-
 function getAutomationState(): AutomationState {
   const automation = window.__mcpAutomationState;
   if (automation) {
-    return {
-      autoExecute: automation.autoExecute === true,
-      autoInsert: automation.autoInsert === true,
-      autoSubmit: automation.autoSubmit === true,
-      autoInsertDelay: numericDelay(automation.autoInsertDelay),
-      autoSubmitDelay: numericDelay(automation.autoSubmitDelay),
-    };
+    return { autoExecute: automation.autoExecute === true };
   }
 
   const legacy = window.toggleState;
-  return {
-    autoExecute: legacy?.autoExecute === true,
-    autoInsert: legacy?.autoInsert === true,
-    autoSubmit: legacy?.autoSubmit === true,
-    autoInsertDelay: 0,
-    autoSubmitDelay: 0,
-  };
+  return { autoExecute: legacy?.autoExecute === true };
 }
 
 function generalAutoExecuteEnabled(): boolean {
@@ -175,6 +155,26 @@ function getCurrentAdapter(): any {
   return window.mcpAdapter || window.getCurrentAdapter?.() || null;
 }
 
+function resultToText(result: unknown): string {
+  if (result && typeof result === 'object') {
+    const content = (result as any).content;
+    if (Array.isArray(content)) {
+      const textParts = content
+        .filter(item => item?.type === 'text' && typeof item?.text === 'string')
+        .map(item => item.text);
+      if (textParts.length > 0) return textParts.join('\n');
+    }
+
+    try {
+      return JSON.stringify(result, null, 2);
+    } catch {
+      return String(result);
+    }
+  }
+
+  return String(result ?? '');
+}
+
 async function getOriginSession(): Promise<StatusResponse['originSession']> {
   const response = (await chrome.runtime.sendMessage({ type: REVIEW_STATUS_MESSAGE })) as StatusResponse;
   if (!response?.success || !response.originSession) return null;
@@ -189,83 +189,46 @@ async function getOriginSession(): Promise<StatusResponse['originSession']> {
   return response.originSession;
 }
 
-async function waitFor<T>(probe: () => T | null, timeoutMs: number, intervalMs = 100): Promise<T> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const value = probe();
-    if (value) return value;
-    await new Promise(resolve => window.setTimeout(resolve, intervalMs));
+async function executeThroughSharedMcpClient(call: ParsedReadCall): Promise<unknown> {
+  const mcpClient = window.mcpClient;
+  if (!mcpClient || typeof mcpClient.callTool !== 'function') {
+    throw new Error('MCP client اصلی صفحه آماده نیست.');
   }
-  throw new Error('زمان انتظار برای تکمیل مسیر اصلی اجرای MCP به پایان رسید.');
+  if (typeof mcpClient.isReady === 'function' && !mcpClient.isReady()) {
+    throw new Error('MCP client اصلی هنوز آماده اجرای ابزار نیست.');
+  }
+
+  // This is the same execution API used by the renderer's native Run button.
+  // The MCP client itself remains responsible for Gate enforcement, repo scope,
+  // origin binding, limits, alias mapping, and the actual server call.
+  return await mcpClient.callTool(call.toolName, call.args);
 }
 
-function getResultPanel(block: HTMLElement, callId: string): HTMLElement | null {
-  return (
-    Array.from(block.querySelectorAll<HTMLElement>('.function-results-panel[data-call-id]')).find(
-      panel => panel.getAttribute('data-call-id') === callId,
-    ) || null
-  );
-}
+async function returnResultToConversation(call: ParsedReadCall, result: unknown): Promise<void> {
+  if (!(await getOriginSession())) {
+    throw new Error('نشست Code Review پیش از برگشت نتیجه پایان یافت.');
+  }
 
-async function submitConversation(): Promise<void> {
   const adapter = getCurrentAdapter();
-  if (!adapter || typeof adapter.submitForm !== 'function') {
-    throw new Error('آداپتر چت برای ارسال نتیجه ابزار آماده نیست.');
+  if (!adapter || typeof adapter.insertText !== 'function' || typeof adapter.submitForm !== 'function') {
+    throw new Error('آداپتر چت برای برگرداندن نتیجه ابزار آماده نیست.');
   }
+
+  const wrapper = `<function_result call_id="${call.callId}">\n${resultToText(result)}\n</function_result>`;
+  const inserted = await adapter.insertText(wrapper);
+  if (!inserted) throw new Error('نتیجه ابزار GitHub در گفتگو درج نشد.');
+
   const submitted = await adapter.submitForm();
-  if (!submitted) throw new Error('ارسال نتیجه ابزار GitHub برای مدل ناموفق بود.');
+  if (!submitted) throw new Error('نتیجه ابزار GitHub برای مدل ارسال نشد.');
 }
 
-async function forwardSuccessfulResult(block: HTMLElement, call: ParsedReadCall): Promise<void> {
-  const automation = getAutomationState();
-
-  // If upstream automation already owns both insert and submit, do not race it.
-  if (automation.autoInsert && automation.autoSubmit) {
-    const delayMs = (automation.autoInsertDelay + automation.autoSubmitDelay) * 1000 + 1200;
-    if (delayMs > 0) await new Promise(resolve => window.setTimeout(resolve, delayMs));
-    return;
-  }
-
-  if (automation.autoInsert) {
-    // Let upstream AutomationService perform the insertion, then only supply the
-    // missing submit step for the approved Code Review session.
-    const delayMs = automation.autoInsertDelay * 1000 + 350;
-    if (delayMs > 0) await new Promise(resolve => window.setTimeout(resolve, delayMs));
-    if (!(await getOriginSession())) throw new Error('نشست Code Review پیش از ارسال نتیجه پایان یافت.');
-    await submitConversation();
-    return;
-  }
-
-  // Auto Insert is OFF. Use the renderer's own Insert button so formatting,
-  // adapter selection, history, and compatibility behavior remain upstream-owned.
-  const insertButton = await waitFor<HTMLButtonElement>(
-    () => block.querySelector<HTMLButtonElement>('.insert-result-button'),
-    5000,
-  );
-
-  if (!insertButton.disabled) insertButton.click();
-
-  await waitFor<HTMLElement>(
-    () =>
-      insertButton.classList.contains('insert-success') || (insertButton.textContent || '').includes('Inserted!')
-        ? insertButton
-        : null,
-    5000,
-  );
-
-  if (!(await getOriginSession())) throw new Error('نشست Code Review پیش از ارسال نتیجه پایان یافت.');
-
-  // AutomationService only auto-submits after its own auto-insert succeeds. Since
-  // we intentionally used the renderer's manual Insert path, submit explicitly.
-  await submitConversation();
-}
-
-async function executeReadThroughUpstream(source: HTMLElement, call: ParsedReadCall): Promise<void> {
+async function executeApprovedRead(source: HTMLElement, call: ParsedReadCall): Promise<void> {
   const key = callKey(call);
   if (completedCalls.has(key) || inFlightCalls.has(key)) return;
+  if (source.getAttribute('data-code-review-read-final-error') === 'true') return;
 
-  const block = source.closest<HTMLElement>('.function-block');
-  if (!block) return;
+  const retryAfter = retryAfterBySource.get(source) || 0;
+  if (retryAfter > Date.now()) return;
 
   inFlightCalls.add(key);
   source.setAttribute('data-code-review-read-executing', 'true');
@@ -274,63 +237,48 @@ async function executeReadThroughUpstream(source: HTMLElement, call: ParsedReadC
     const session = await getOriginSession();
     if (!session?.id) return;
 
-    const automation = getAutomationState();
-    let resultPanel = getResultPanel(block, call.callId);
-    let successNode = resultPanel?.querySelector<HTMLElement>('.function-result-success') || null;
-    let errorNode = resultPanel?.querySelector<HTMLElement>('.function-result-error') || null;
+    const result = await executeThroughSharedMcpClient(call);
 
-    if (!successNode && !errorNode && !automation.autoExecute) {
-      const executeButton = block.querySelector<HTMLButtonElement>('.execute-button');
-      if (!executeButton) throw new Error('دکمه Run اصلی MCP برای این فراخوانی پیدا نشد.');
-
-      if (!executeButton.disabled) {
-        block.setAttribute('data-code-review-upstream-run', call.callId);
-        executeButton.click();
-      }
+    if (!(await getOriginSession())) {
+      throw new Error('نشست Code Review پیش از برگشت نتیجه پایان یافت.');
     }
 
-    resultPanel = await waitFor<HTMLElement>(() => getResultPanel(block, call.callId), 5000);
-
-    const outcome = await waitFor<{ success?: HTMLElement; error?: HTMLElement }>(() => {
-      const success = resultPanel?.querySelector<HTMLElement>('.function-result-success') || null;
-      if (success) return { success };
-      const error = resultPanel?.querySelector<HTMLElement>('.function-result-error') || null;
-      if (error) return { error };
-      return null;
-    }, 30000);
-
-    if (outcome.error) {
-      throw new Error((outcome.error.textContent || '').trim() || `اجرای ${call.toolName} در مسیر اصلی MCP ناموفق بود.`);
-    }
-
-    if (!(await getOriginSession())) throw new Error('نشست Code Review پیش از برگشت نتیجه پایان یافت.');
-
-    await forwardSuccessfulResult(block, call);
+    await returnResultToConversation(call, result);
 
     completedCalls.add(key);
     source.setAttribute('data-code-review-read-executed', 'true');
-    block.setAttribute('data-code-review-read-complete', call.callId);
+    source.removeAttribute('data-code-review-read-error');
+    retryAfterBySource.delete(source);
     attemptsBySource.delete(source);
 
     emitRuntimeToast(
       'نتیجه GitHub به مدل برگشت',
-      `${call.toolName} از مسیر اصلی MCP اجرا شد و نتیجه برای ادامه بررسی به همین گفتگو ارسال شد.`,
+      `${call.toolName} از MCP client اصلی اجرا شد و نتیجه برای ادامه بررسی به همین گفتگو ارسال شد.`,
       'success',
     );
   } catch (error) {
+    const stillActive = await getOriginSession().catch(() => null);
+    if (!stillActive) return;
+
     const attempts = (attemptsBySource.get(source) || 0) + 1;
     attemptsBySource.set(source, attempts);
     source.setAttribute('data-code-review-read-error', String(attempts));
+
+    if (attempts < MAX_EXECUTION_ATTEMPTS && !disposed) {
+      const retryDelay = attempts * 900;
+      retryAfterBySource.set(source, Date.now() + retryDelay);
+      window.setTimeout(scheduleScan, retryDelay + 25);
+      return;
+    }
+
+    source.setAttribute('data-code-review-read-final-error', 'true');
+    retryAfterBySource.delete(source);
 
     emitRuntimeToast(
       'اجرای ابزار Read-only GitHub ناموفق بود',
       error instanceof Error ? error.message : String(error),
       'error',
     );
-
-    if (attempts < 3 && !disposed) {
-      window.setTimeout(scheduleScan, attempts * 900);
-    }
   } finally {
     inFlightCalls.delete(key);
     source.removeAttribute('data-code-review-read-executing');
@@ -338,18 +286,22 @@ async function executeReadThroughUpstream(source: HTMLElement, call: ParsedReadC
 }
 
 function scan(): void {
-  if (disposed) return;
+  if (disposed || generalAutoExecuteEnabled()) return;
 
   // The renderer stores authoritative model-produced JSON in this hidden panel.
-  // We only use it to identify the approved read call; actual execution and result
-  // insertion go through the renderer's native Run/Insert pipeline.
+  // It is used only to identify the real completed read call. Execution itself
+  // goes through window.mcpClient.callTool, exactly like the renderer Run path.
   document.querySelectorAll<HTMLElement>('.function-block .xml-results-panel pre').forEach(source => {
     if (source.getAttribute('data-code-review-read-executed') === 'true') return;
     if (source.getAttribute('data-code-review-read-executing') === 'true') return;
+    if (source.getAttribute('data-code-review-read-final-error') === 'true') return;
+
+    const retryAfter = retryAfterBySource.get(source) || 0;
+    if (retryAfter > Date.now()) return;
 
     const call = parseApprovedReadCall(source.textContent || '');
     if (!call) return;
-    void executeReadThroughUpstream(source, call);
+    void executeApprovedRead(source, call);
   });
 }
 
@@ -373,7 +325,7 @@ function install(): void {
     observer = new MutationObserver(scheduleScan);
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 
-    // Approval and automation state can change without a DOM mutation.
+    // Approval, MCP readiness, and automation state can change without a DOM mutation.
     window.setInterval(scheduleScan, 500);
   };
 
@@ -387,4 +339,5 @@ export const codeReviewReadExecutorTestUtils = {
   generalAutoExecuteEnabled,
   getAutomationState,
   parseApprovedReadCall,
+  resultToText,
 };
