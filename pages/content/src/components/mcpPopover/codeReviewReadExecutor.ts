@@ -78,9 +78,10 @@ function generalAutoExecuteEnabled(): boolean {
   const legacy = window.toggleState;
   if (legacy && typeof legacy.autoExecute === 'boolean') return legacy.autoExecute;
 
-  // Until the user's automation preference is initialized, leave execution to
-  // the normal renderer. This prevents a race that could execute the same call twice.
-  return true;
+  // Mirror the renderer's effective default: if automation state has not been
+  // published yet, normal Auto Execute is OFF. The Code Review executor may
+  // therefore handle an approved read without racing a renderer auto-execution.
+  return false;
 }
 
 function parseJsonLines(text: string): any[] {
@@ -129,7 +130,7 @@ function callKey(call: ParsedReadCall): string {
       acc[key] = call.args[key];
       return acc;
     }, {});
-  return `${window.location.pathname}${window.location.search}|${call.toolName}|${call.callId}|${JSON.stringify(sortedArgs)}`;
+  return `${window.location.pathname}|${call.toolName}|${call.callId}|${JSON.stringify(sortedArgs)}`;
 }
 
 function getCurrentAdapter(): any {
@@ -252,8 +253,11 @@ async function executeReadCall(source: HTMLElement, call: ParsedReadCall): Promi
 function scan(): void {
   if (disposed || generalAutoExecuteEnabled()) return;
 
-  document.querySelectorAll<HTMLElement>('pre').forEach(source => {
-    if (source.closest('.function-block')) return;
+  // The renderer stores the authoritative raw model function-call JSON in a
+  // hidden .xml-results-panel inside the rendered .function-block. Restricting
+  // scanning to that panel avoids treating arbitrary user-authored <pre> text as
+  // executable while still working whether or not "Show Raw Info" is expanded.
+  document.querySelectorAll<HTMLElement>('.function-block .xml-results-panel pre').forEach(source => {
     if (source.getAttribute('data-code-review-read-executed') === 'true') return;
     if (source.getAttribute('data-code-review-read-executing') === 'true') return;
 
