@@ -118,6 +118,26 @@ assert.doesNotMatch(
   /38107/,
   'the PAT-bearing upstream proxy port must never be published or managed in the host launcher',
 );
+assert.doesNotMatch(
+  launcher,
+  /src=\$\{GITHUB_ENV_PATH\},dst=\/run\/secrets\/github\.env/,
+  'GitHub credential file must not be bind-mounted into the secure runtime',
+);
+assert.match(
+  launcher,
+  /--tmpfs "\/run\/secrets:rw,noexec,nosuid,nodev,mode=0700"/,
+  'GitHub credential must land only in a container-local tmpfs',
+);
+assert.match(
+  launcher,
+  /cat "\$GITHUB_ENV_PATH" \| exec docker run[\s\S]*cat > \/run\/secrets\/github\.env/,
+  'launcher must stream the GitHub credential over stdin into tmpfs so rootless Docker can consume a mode-0600 host secret without permission weakening',
+);
+assert.doesNotMatch(
+  launcher,
+  /--env(?:-file)?[^\n]*GITHUB/,
+  'GitHub PAT must not be passed in Docker command arguments or container environment configuration',
+);
 assert.match(
   entrypoint,
   /UPSTREAM_PORT="\$\{MCP_UPSTREAM_PORT:-38107\}"/,
@@ -146,3 +166,4 @@ assert.match(
 
 console.log('✓ Capability gateway requires an extension credential + active prompt-bound lease and re-enforces read-only repo scope');
 console.log('✓ PAT-bearing MCP proxy has no host-published port; host traffic can reach only the capability-gated front door');
+console.log('✓ GitHub credential is streamed into container tmpfs without weakening the host secret or exposing it in Docker config');
