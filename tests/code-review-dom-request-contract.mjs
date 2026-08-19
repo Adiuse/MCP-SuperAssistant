@@ -61,6 +61,23 @@ assert.match(
   'the instruction example must stay non-executable so inserting MCP instructions alone cannot create access requests',
 );
 
+assert.match(
+  instructions,
+  /function isActiveCodeReviewToolset\(/,
+  'approved read-only tool exposure must be recognized as an active Code Review continuation',
+);
+assert.match(
+  instructions,
+  /\[MCP Code Review Session Active\]\[IMPORTANT\]/,
+  'approval continuation must use a compact active-session instruction block instead of repeating the initial MCP block',
+);
+assert.match(
+  instructions,
+  /if \(isActiveCodeReviewToolset\(tools\)\) \{[\s\S]{0,120}?return generateActiveCodeReviewInstructions\(toolList\);/,
+  'the compact continuation must be selected automatically after approval exposes the read-only tool set',
+);
+
 console.log('✓ Real DOM request call creates Pending independently of general Auto Execute');
 console.log('✓ Origin session, not global visibility, controls the per-tab tool set');
 console.log('✓ Instruction template remains intentionally non-executable');
+console.log('✓ Approved Code Review resumes with a compact tool delta instead of duplicating the full initial instructions');
