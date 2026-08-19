@@ -16,6 +16,10 @@ import {
   startCodeReviewSession,
 } from './codeReviewGate.js';
 import {
+  activateCodeReviewGatewayLease,
+  revokeCodeReviewGatewayLease,
+} from './codeReviewGatewayCapability.js';
+import {
   clearCodeReviewExpiryNotification,
   notifyCodeReviewRevoked,
   notifyCodeReviewStarted,
@@ -188,6 +192,17 @@ async function auditNotificationResult(input: {
   });
 }
 
+async function revokeGatewayLeaseBestEffort(sessionId: string, reason: string): Promise<void> {
+  try {
+    await revokeCodeReviewGatewayLease(sessionId);
+  } catch (error) {
+    logger.warn(
+      `[CodeReviewControlBridge] Capability gateway revoke failed for ${sessionId} (${reason}):`,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
 export function registerCodeReviewControlBridge(): void {
   if (bridgeRegistered || typeof chrome === 'undefined' || !chrome.runtime?.onMessage) return;
   bridgeRegistered = true;
@@ -195,6 +210,7 @@ export function registerCodeReviewControlBridge(): void {
   registerCodeReviewNotificationListeners(async event => {
     const expired = await expireCodeReviewSession(event.sessionId);
     if (expired) {
+      await revokeGatewayLeaseBestEffort(expired.id, 'alarm expiry');
       logger.debug(`[CodeReviewControlBridge] Expired session ${event.sessionId} for ${expired.owner}/${expired.repo}`);
     }
   });
@@ -230,6 +246,9 @@ export function registerCodeReviewControlBridge(): void {
           });
           for (const invalidated of registered.invalidatedSessions) {
             await clearCodeReviewExpiryNotification(invalidated.id);
+            // Local Gate is already closed. Mirror that revocation to the
+            // out-of-band proxy capability table immediately.
+            await revokeGatewayLeaseBestEffort(invalidated.id, 'new real user prompt');
           }
           return {
             success: true,
@@ -255,8 +274,6 @@ export function registerCodeReviewControlBridge(): void {
           return {
             success: true,
             currentTabId: tabId,
-            // `session` is intentionally origin-only. Global sessions are visible
-            // in `sessions`, but must never masquerade as operational access here.
             session: originSession,
             originSession,
             sessions,
@@ -290,6 +307,19 @@ export function registerCodeReviewControlBridge(): void {
           if (!pending) throw new Error('این درخواست دیگر در صف انتظار وجود ندارد.');
 
           const session = await startCodeReviewSession({ requestId: pending.requestId, approvingTabId });
+          try {
+            // Approval is not operational until the local/remote capability
+            // gateway accepted the same prompt-bound lease. PAT in the upstream
+            // proxy alone is therefore insufficient.
+            await activateCodeReviewGatewayLease(session);
+          } catch (error) {
+            await revokeCodeReviewSession(session.id, 'capability gateway activation failed', approvingTabId);
+            await revokeGatewayLeaseBestEffort(session.id, 'rollback failed approval');
+            throw new Error(
+              `Secure capability gateway is not ready: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+
           await scheduleCodeReviewExpiryNotification({
             sessionId: session.id,
             owner: session.owner,
@@ -339,8 +369,6 @@ export function registerCodeReviewControlBridge(): void {
           const requestedSessionId = readOptionalSessionId(message);
           const sessions = await getActiveCodeReviewSessions();
           const originSession = await getActiveCodeReviewSessionForOrigin(actorTabId, sender.tab?.url);
-          // Global management must name an exact session. Without an id, only
-          // the current origin session may be revoked; never fall back to another chat.
           const target = requestedSessionId
             ? sessions.find(item => item.id === requestedSessionId) || null
             : originSession;
@@ -349,6 +377,7 @@ export function registerCodeReviewControlBridge(): void {
           const revoked = await revokeCodeReviewSession(target.id, 'manual revoke from Code Review security UI', actorTabId);
           if (!revoked) throw new Error('نشست انتخاب‌شده دیگر فعال نیست.');
           await clearCodeReviewExpiryNotification(revoked.id);
+          await revokeGatewayLeaseBestEffort(revoked.id, 'manual revoke');
           const sent = await notifyCodeReviewRevoked(revoked.owner, revoked.repo);
           await auditNotificationResult({
             sent,
