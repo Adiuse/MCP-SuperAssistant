@@ -93,7 +93,7 @@ const resumeAttempts = new Map<string, ResumeAttempt>();
 const surfacedPendingRequestIds = new Set<string>();
 
 function currentConversationPath(): string {
-  return `${window.location.pathname}${window.location.search}`;
+  return window.location.pathname;
 }
 
 function parseJsonObjects(text: string): any[] {
@@ -413,7 +413,7 @@ export function HeadlessInstructionSync() {
         const owner = session.owner || 'GitHub';
         const repo = session.repo || 'repository';
         const duration = Number(session.durationMinutes) || 0;
-        const continuation = `${updatedInstructions}\n\n[MCP Approval Result] Code Review access is approved and active for ${owner}/${repo}${duration ? ` for ${duration} minutes` : ''}. Continue the user's pending repository task now using the exposed read-only MCP tools. Do not request access again unless this session expires or is revoked.`;
+        const continuation = `${updatedInstructions}\n\n[MCP Approval Result] Code Review access is approved and active for ${owner}/${repo}${duration ? ` for ${duration} minutes` : ''}. Continue the user's pending repository task now using the exposed read-only MCP tools. This lease is bound to the real user prompt that created this review job. Internal extension results continue the same job; any later ordinary user prompt requires fresh approval before further GitHub reads.`;
 
         const inserted = await adapter.insertText(continuation);
         if (!inserted) throw new Error('درج پیام ادامه در چت ناموفق بود.');
