@@ -35,6 +35,13 @@ assert.match(
 );
 assert.match(source, /MAX_EXECUTION_ATTEMPTS\s*=\s*3/);
 assert.match(source, /data-code-review-read-final-error/);
+assert.match(source, /parseGitHubDeviceAuthChallenge\(result\)/);
+assert.match(source, /data-code-review-read-auth-required/);
+assert.match(
+  source,
+  /کد ورود برای امنیت به مدل ارسال نشد/,
+  'GitHub device-login challenges must be kept out of model context',
+);
 assert.doesNotMatch(
   source,
   /querySelector[^\n]*\.execute-button|executeButton\.click\(\)/,
@@ -130,4 +137,19 @@ assert.equal(
   '# README',
 );
 
-console.log('✓ Approved Code Review reads use the shared MCP client API without Run/Insert DOM coupling');
+const authChallengeText =
+  'Visit https://github.com/login/device and enter the code 31FC-ADD4 to authorize the GitHub MCP Server. ' +
+  'After authorizing, retry your request.';
+assert.deepEqual(
+  utils.parseGitHubDeviceAuthChallenge({ content: [{ type: 'text', text: authChallengeText }] }),
+  {
+    verificationUrl: 'https://github.com/login/device',
+    userCode: '31FC-ADD4',
+  },
+);
+assert.equal(
+  utils.parseGitHubDeviceAuthChallenge({ content: [{ type: 'text', text: '# README' }] }),
+  null,
+);
+
+console.log('✓ Approved Code Review reads use the shared MCP client and keep GitHub auth challenges out of model context');
