@@ -5,8 +5,9 @@ CONFIG_PATH="${MCP_SUPERASSISTANT_CONFIG:-/run/bootstrap/config.json}"
 GITHUB_ENV_PATH="${MCP_SUPERASSISTANT_GITHUB_ENV:-/run/bootstrap/github.env}"
 PUBLIC_PORT="${MCP_GATEWAY_PUBLIC_PORT:-38106}"
 GATEWAY_INTERNAL_PORT="${MCP_GATEWAY_INTERNAL_PORT:-38108}"
+UPSTREAM_HOST="${MCP_UPSTREAM_HOST:-127.0.0.1}"
 UPSTREAM_PORT="${MCP_UPSTREAM_PORT:-38107}"
-UPSTREAM_URL="${MCP_UPSTREAM_URL:-http://localhost:${UPSTREAM_PORT}/mcp}"
+UPSTREAM_URL="${MCP_UPSTREAM_URL:-http://${UPSTREAM_HOST}:${UPSTREAM_PORT}/mcp}"
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
   echo "MCP config not found inside secure runtime: $CONFIG_PATH" >&2
@@ -58,12 +59,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[secure-code-review] Starting PAT-bearing MCP proxy on container-localhost:${UPSTREAM_PORT}"
+echo "[secure-code-review] Starting PAT-bearing MCP proxy on ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
 echo "[secure-code-review] The PAT-bearing proxy port is NOT published to the host."
 mcp-superassistant-proxy \
   --config "$CONFIG_PATH" \
   --outputTransport streamableHttp \
   --stateful \
+  --host "$UPSTREAM_HOST" \
   --port "$UPSTREAM_PORT" &
 PROXY_PID=$!
 
