@@ -39,3 +39,5 @@ jobs:
         run: pnpm exec node tests/code-review-read-executor-contract.mjs
       - name: Run visible MCP connection settings contract
         run: pnpm exec node tests/mcp-connection-settings-contract.mjs
+      - name: Run secure runtime IPv4 loopback contract
+        run: pnpm exec node tests/secure-runtime-loopback-contract.mjs
