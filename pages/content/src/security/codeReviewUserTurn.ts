@@ -33,8 +33,8 @@ function normalizePromptFingerprint(): string {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 256);
-  // This fingerprint never leaves the content script. It exists only to merge
-  // the trusted keydown/click/submit events produced by one human submission.
+  // This fingerprint stays in memory and is never sent to the background. It
+  // only merges click/keydown signals produced by one human submission.
   return `${window.location.pathname}|${text}`;
 }
 
@@ -64,8 +64,8 @@ async function sendUserTurn(clientSubmissionId: string): Promise<void> {
       timestamp: Date.now(),
     });
   } catch {
-    // The Gate fails closed if a real turn cannot be registered. Do not invent a
-    // local userTurnId or silently authorize an old lease as a fallback.
+    // Fail closed: the Gate will not create a pending request without a trusted
+    // current UserTurn. Never invent a local turn or reuse an old lease.
   }
 }
 
@@ -75,9 +75,9 @@ function registerTrustedUserSignal(): void {
   const initialPath = window.location.pathname;
   void sendUserTurn(submissionId);
 
-  // ChatGPT creates /c/<id> only after the first prompt in a new chat. Mirror
-  // the same trusted submission into that newly-created conversation pathname,
-  // but never migrate a turn from one existing /c/* conversation to another.
+  // A brand-new ChatGPT chat receives /c/<id> shortly after the first prompt.
+  // Mirror this same trusted submission into that generated pathname. Never
+  // migrate a turn from one existing /c/* conversation into another.
   if (!initialPath.startsWith('/c/')) {
     for (const delay of [300, 900, 1_800]) {
       window.setTimeout(() => {
@@ -96,6 +96,8 @@ function isUsableSendButton(element: Element | null): boolean {
 }
 
 function onTrustedClick(event: MouseEvent): void {
+  // `isTrusted` is the security boundary between a browser/user gesture and a
+  // page/extension synthetic event. Model/page JS cannot manufacture true here.
   if (!event.isTrusted || isInternalSubmission()) return;
   if (!isUsableSendButton(event.target as Element | null)) return;
   registerTrustedUserSignal();
@@ -109,28 +111,18 @@ function onTrustedKeyDown(event: KeyboardEvent): void {
   registerTrustedUserSignal();
 }
 
-function onTrustedSubmit(event: SubmitEvent): void {
-  if (!event.isTrusted || isInternalSubmission()) return;
-  const form = event.target instanceof HTMLFormElement ? event.target : null;
-  if (!form || !form.querySelector(PROMPT_SELECTOR)) return;
-  registerTrustedUserSignal();
-}
-
 export function installCodeReviewUserTurnDetector(): () => void {
   if (installed) return () => {};
   installed = true;
-
-  // Capture phase observes the browser-trusted human gesture before host React
-  // handlers clear the composer. Synthetic extension/page events have
-  // event.isTrusted === false and cannot manufacture a trusted UserTurn.
+  // Capture before host React handlers clear/mutate the composer. We deliberately
+  // do not trust generic submit events: human click/keydown is the authoritative
+  // signal, while programmatic requestSubmit()/submit() must not create turns.
   document.addEventListener('click', onTrustedClick, true);
   document.addEventListener('keydown', onTrustedKeyDown, true);
-  document.addEventListener('submit', onTrustedSubmit, true);
 
   return () => {
     document.removeEventListener('click', onTrustedClick, true);
     document.removeEventListener('keydown', onTrustedKeyDown, true);
-    document.removeEventListener('submit', onTrustedSubmit, true);
     installed = false;
   };
 }
@@ -148,4 +140,11 @@ export async function runAsCodeReviewInternalSubmission<T>(operation: () => Prom
 
 export function isCodeReviewInternalSubmissionActive(): boolean {
   return isInternalSubmission();
+}
+
+// This module is loaded by the always-mounted MCP security UI. Self-installing
+// keeps turn detection independent of whether the popover is open or closed.
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  if (document.body) installCodeReviewUserTurnDetector();
+  else document.addEventListener('DOMContentLoaded', () => installCodeReviewUserTurnDetector(), { once: true });
 }
