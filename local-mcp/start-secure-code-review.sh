@@ -4,54 +4,56 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${MCP_SUPERASSISTANT_CONFIG:-$HOME/.config/mcp-superassistant/config.json}"
 GITHUB_ENV_PATH="${MCP_SUPERASSISTANT_GITHUB_ENV:-$HOME/.config/mcp-superassistant/github.env}"
-GATEWAY_HOST="${MCP_GATEWAY_HOST:-localhost}"
+HOST_BIND="${MCP_GATEWAY_HOST_BIND:-127.0.0.1}"
 GATEWAY_PORT="${MCP_GATEWAY_PORT:-38106}"
-UPSTREAM_PORT="${MCP_UPSTREAM_PORT:-38107}"
-UPSTREAM_URL="${MCP_UPSTREAM_URL:-http://localhost:${UPSTREAM_PORT}/mcp}"
+IMAGE_TAG="${MCP_SECURE_RUNTIME_IMAGE:-mcp-superassistant-secure-runtime:prompt-bound}"
+CONTAINER_NAME="${MCP_SECURE_RUNTIME_CONTAINER:-mcp-superassistant-secure-runtime}"
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
   echo "MCP config not found: $CONFIG_PATH" >&2
   exit 1
 fi
 
-if [[ -f "$GITHUB_ENV_PATH" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$GITHUB_ENV_PATH"
-  set +a
-fi
-
-if [[ -z "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ]]; then
-  echo "GITHUB_PERSONAL_ACCESS_TOKEN is not exported. Set it in: $GITHUB_ENV_PATH" >&2
+if [[ ! -f "$GITHUB_ENV_PATH" ]]; then
+  echo "GitHub credential file not found: $GITHUB_ENV_PATH" >&2
   exit 1
 fi
 
-cleanup() {
-  if [[ -n "${PROXY_PID:-}" ]]; then
-    kill "$PROXY_PID" 2>/dev/null || true
-    wait "$PROXY_PID" 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
-echo "[secure-code-review] Starting upstream MCP proxy on port $UPSTREAM_PORT"
-npm exec @srbhptl39/mcp-superassistant-proxy@latest -- \
-  --config "$CONFIG_PATH" \
-  --outputTransport streamableHttp \
-  --stateful \
-  --port "$UPSTREAM_PORT" &
-PROXY_PID=$!
-
-# Give the upstream process a moment to bind before exposing the front door.
-sleep 1
-if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-  echo "Upstream MCP proxy exited before the secure gateway could start." >&2
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required for the isolated secure Code Review runtime." >&2
   exit 1
 fi
 
-echo "[secure-code-review] Starting capability gateway on http://${GATEWAY_HOST}:${GATEWAY_PORT}/mcp"
-echo "[secure-code-review] Keep the extension MCP URL pointed at http://localhost:${GATEWAY_PORT}/mcp"
-MCP_GATEWAY_HOST="$GATEWAY_HOST" \
-MCP_GATEWAY_PORT="$GATEWAY_PORT" \
-MCP_UPSTREAM_URL="$UPSTREAM_URL" \
-  node "$ROOT_DIR/local-mcp/code-review-capability-gateway.mjs"
+if [[ ! -S /var/run/docker.sock ]]; then
+  echo "Docker socket not found: /var/run/docker.sock" >&2
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker daemon is not available to the current user." >&2
+  exit 1
+fi
+
+# A previous crashed run must never leave an old secure runtime behind.
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+echo "[secure-code-review] Building isolated secure runtime image (Docker cache will be reused)..."
+docker build \
+  --file "$ROOT_DIR/local-mcp/secure-runtime.Dockerfile" \
+  --tag "$IMAGE_TAG" \
+  "$ROOT_DIR"
+
+echo "[secure-code-review] Publishing ONLY ${HOST_BIND}:${GATEWAY_PORT} -> capability gateway"
+echo "[secure-code-review] PAT-bearing upstream remains on container loopback and has no host port."
+echo "[secure-code-review] Extension Streamable HTTP URL: http://${HOST_BIND}:${GATEWAY_PORT}/mcp"
+
+exec docker run \
+  --rm \
+  --name "$CONTAINER_NAME" \
+  --publish "${HOST_BIND}:${GATEWAY_PORT}:38106" \
+  --mount "type=bind,src=${CONFIG_PATH},dst=/run/config/config.json,readonly" \
+  --mount "type=bind,src=${GITHUB_ENV_PATH},dst=/run/secrets/github.env,readonly" \
+  --mount "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock" \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  "$IMAGE_TAG"
