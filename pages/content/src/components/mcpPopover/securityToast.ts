@@ -1,3 +1,4 @@
+import '../../security/codeReviewUserTurn';
 import './codeReviewReadExecutor';
 
 export type SecurityToastVariant = 'info' | 'success' | 'warning' | 'error';
