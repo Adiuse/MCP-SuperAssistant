@@ -1,0 +1,30 @@
+name: Code Review Security
+
+on:
+  push:
+    branches:
+      - agent/finalize-code-review-business-logic
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+
+jobs:
+  security-flow:
+    name: Code Review security flow
+    runs-on: ubuntu-latest
+    env:
+      CEB_CI: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --prefer-offline
+      - name: Type-check Chrome extension
+        run: pnpm --filter chrome-extension type-check
+      - name: Run Code Review isolation and expiry flow
+        run: pnpm exec node tests/code-review-flow.mjs
