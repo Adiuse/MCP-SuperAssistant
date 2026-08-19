@@ -19,6 +19,11 @@ if [[ ! -f "$GITHUB_ENV_PATH" ]]; then
   exit 1
 fi
 
+if ! grep -q '^GITHUB_PERSONAL_ACCESS_TOKEN=' "$GITHUB_ENV_PATH"; then
+  echo "GITHUB_PERSONAL_ACCESS_TOKEN is not defined in: $GITHUB_ENV_PATH" >&2
+  exit 1
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "Docker is required for the isolated secure Code Review runtime." >&2
   exit 1
@@ -45,15 +50,23 @@ docker build \
 
 echo "[secure-code-review] Publishing ONLY ${HOST_BIND}:${GATEWAY_PORT} -> capability gateway"
 echo "[secure-code-review] PAT-bearing upstream remains on container loopback and has no host port."
+echo "[secure-code-review] GitHub credential is streamed into container tmpfs; it is not bind-mounted or passed in Docker args/env."
 echo "[secure-code-review] Extension Streamable HTTP URL: http://${HOST_BIND}:${GATEWAY_PORT}/mcp"
 
-exec docker run \
+# Stream the credential file through stdin into a container-only tmpfs. This
+# works with rootless/user-namespace Docker where a mode-0600 host bind mount
+# can become unreadable inside the container, without weakening host file
+# permissions or exposing the PAT in docker inspect / command arguments.
+cat "$GITHUB_ENV_PATH" | exec docker run \
   --rm \
+  --interactive \
   --name "$CONTAINER_NAME" \
   --publish "${HOST_BIND}:${GATEWAY_PORT}:38106" \
   --mount "type=bind,src=${CONFIG_PATH},dst=/run/config/config.json,readonly" \
-  --mount "type=bind,src=${GITHUB_ENV_PATH},dst=/run/secrets/github.env,readonly" \
   --mount "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock" \
+  --tmpfs "/run/secrets:rw,noexec,nosuid,nodev,mode=0700" \
   --cap-drop ALL \
   --security-opt no-new-privileges \
-  "$IMAGE_TAG"
+  --entrypoint /bin/bash \
+  "$IMAGE_TAG" \
+  -lc 'umask 077; cat > /run/secrets/github.env; exec /opt/mcp-superassistant/secure-runtime-entrypoint.sh'
