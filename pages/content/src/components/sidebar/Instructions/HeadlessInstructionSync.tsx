@@ -10,6 +10,7 @@ import { emitSecurityToast } from '../../mcpPopover/securityToast';
 
 const logger = createLogger('HeadlessInstructionSync');
 const REVIEW_REQUEST_TOOL = 'request_code_review_access';
+const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]';
 const RESUMED_SESSIONS_KEY = 'mcpCodeReviewResumedSessionIds';
 const READ_TOOL_NAMES = new Set([
   'get_me',
@@ -25,7 +26,8 @@ const READ_TOOL_NAMES = new Set([
   'list_pull_requests',
   'pull_request_read',
 ]);
-const READ_TOOL_PATTERN = /###\s+(get_me|get_file_contents|get_repository_tree|search_code|list_commits|get_commit|get_file_blame|list_branches|list_tags|get_tag|list_pull_requests|pull_request_read)\b/;
+const READ_TOOL_PATTERN =
+  /###\s+(get_me|get_file_contents|get_repository_tree|search_code|list_commits|get_commit|get_file_blame|list_branches|list_tags|get_tag|list_pull_requests|pull_request_read)\b/;
 
 interface PendingReviewRequest {
   requestId?: string;
@@ -117,6 +119,10 @@ function containsReviewRequestCall(text: string): boolean {
   return parseJsonObjects(text).some(
     item => item?.type === 'function_call_start' && item?.name === REVIEW_REQUEST_TOOL,
   );
+}
+
+function isAssistantModelOutput(source: HTMLElement): boolean {
+  return !!source.closest(ASSISTANT_MESSAGE_SELECTOR) && !source.closest('[data-message-author-role="user"]');
 }
 
 function pendingRequestId(request: PendingReviewRequest): string | undefined {
@@ -283,8 +289,7 @@ function emitToastForAuditEntry(entry: ReviewAuditEntry): void {
         id: `security-denied:${entry.timestamp || Date.now()}:${entry.toolName || entry.action}`,
         title: 'درخواست امنیتی مسدود شد',
         message:
-          [entry.toolName, entry.resource, entry.reason].filter(Boolean).join(' — ') ||
-          'Gate این عملیات را مسدود کرد.',
+          [entry.toolName, entry.resource, entry.reason].filter(Boolean).join(' — ') || 'Gate این عملیات را مسدود کرد.',
         variant: 'error',
         durationMs: 6500,
       });
@@ -484,6 +489,10 @@ export function HeadlessInstructionSync() {
       document.querySelectorAll<HTMLElement>('pre').forEach(source => {
         if (source.getAttribute('data-review-request-observed') === 'true') return;
         if (source.closest('.function-block')) return;
+        // Ordinary page/user DOM is attacker-controlled. Only a rendered block
+        // inside ChatGPT's assistant-authored message container may create a
+        // pending access request; unknown provenance fails closed.
+        if (!isAssistantModelOutput(source)) return;
         if (!containsReviewRequestCall(source.textContent || '')) return;
 
         // In MCP SuperAssistant a model "tool call" is emitted into the chat DOM
@@ -637,9 +646,7 @@ export function HeadlessInstructionSync() {
         name: tool.name,
         description: tool.description || '',
         schema:
-          typeof (tool as any).schema === 'string'
-            ? (tool as any).schema
-            : JSON.stringify(tool.input_schema || {}),
+          typeof (tool as any).schema === 'string' ? (tool as any).schema : JSON.stringify(tool.input_schema || {}),
       })),
     [tools],
   );

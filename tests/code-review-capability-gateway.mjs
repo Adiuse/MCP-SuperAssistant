@@ -1,200 +1,269 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import http from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, '..');
 const gatewayPath = path.join(repoRoot, 'local-mcp', 'code-review-capability-gateway.mjs');
-const launcherPath = path.join(repoRoot, 'local-mcp', 'start-secure-code-review.sh');
-const dockerfilePath = path.join(repoRoot, 'local-mcp', 'secure-runtime.Dockerfile');
-const entrypointPath = path.join(repoRoot, 'local-mcp', 'secure-runtime-entrypoint.sh');
 const gateway = await import(`${pathToFileURL(gatewayPath).href}?t=${Date.now()}`);
-const [launcher, dockerfile, entrypoint] = await Promise.all([
-  fs.readFile(launcherPath, 'utf8'),
-  fs.readFile(dockerfilePath, 'utf8'),
-  fs.readFile(entrypointPath, 'utf8'),
+const [launcher, dockerfile, entrypoint, config] = await Promise.all([
+  fs.readFile(path.join(repoRoot, 'local-mcp', 'start-secure-code-review.sh'), 'utf8'),
+  fs.readFile(path.join(repoRoot, 'local-mcp', 'secure-runtime.Dockerfile'), 'utf8'),
+  fs.readFile(path.join(repoRoot, 'local-mcp', 'secure-runtime-entrypoint.sh'), 'utf8'),
+  fs.readFile(path.join(repoRoot, 'local-mcp', 'config.json'), 'utf8'),
 ]);
 
 const DEVICE = 'a'.repeat(64);
-const state = gateway.createGatewayState();
+const TOKEN = 'c'.repeat(64);
 const now = Date.now();
 
-const lease = gateway.registerLease(state, DEVICE, {
-  sessionId: 'session-a',
-  capabilityId: 'cap-a',
-  jobId: 'job-a',
-  userTurnId: 'turn-a',
-  owner: 'Adiuse',
-  repo: 'shaahane-monorepo',
-  originTabId: 42,
-  sourcePath: '/c/review-a',
-  expiresAt: now + 20 * 60_000,
-  readOnly: true,
-  allowedTools: [...gateway.ALLOWED_TOOLS],
-});
-assert.equal(lease.jobId, 'job-a');
+function leasePayload(overrides = {}) {
+  return {
+    sessionId: 'session-a',
+    capabilityId: 'cap-a',
+    capabilityToken: TOKEN,
+    jobId: 'job-a',
+    userTurnId: 'turn-a',
+    owner: 'Adiuse',
+    repo: 'shaahane-monorepo',
+    originTabId: 42,
+    sourcePath: '/c/review-a',
+    expiresAt: now + 20 * 60_000,
+    readOnly: true,
+    serverId: gateway.CODE_REVIEW_SERVER_ID,
+    allowedTools: [...gateway.ALLOWED_TOOLS],
+    ...overrides,
+  };
+}
 
-const read = gateway.authorizeToolCall(state, DEVICE, {
-  method: 'tools/call',
-  params: {
-    name: 'github-review.get_file_contents',
-    arguments: { owner: 'Adiuse', repo: 'shaahane-monorepo', path: 'apps/api/src/a.ts' },
-  },
-}, now);
+function envelope(overrides = {}) {
+  return {
+    sessionId: 'session-a',
+    capabilityId: 'cap-a',
+    capabilityToken: TOKEN,
+    jobId: 'job-a',
+    userTurnId: 'turn-a',
+    originTabId: 42,
+    sourcePath: '/c/review-a',
+    serverId: gateway.CODE_REVIEW_SERVER_ID,
+    ...overrides,
+  };
+}
+
+function toolRequest(name, args = {}, bindingOverrides = {}) {
+  return {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: {
+      name,
+      arguments: {
+        ...args,
+        [gateway.CAPABILITY_ARGUMENT]: envelope(bindingOverrides),
+      },
+    },
+  };
+}
+
+const state = gateway.createGatewayState();
+const lease = gateway.registerLease(state, DEVICE, leasePayload());
+const read = gateway.authorizeToolCall(
+  state,
+  DEVICE,
+  toolRequest('github-review__get_file_contents', {
+    owner: 'Adiuse',
+    repo: 'shaahane-monorepo',
+    path: 'apps/api/src/a.ts',
+  }),
+  now,
+);
 assert.equal(read.ok, true);
 assert.equal(read.lease.userTurnId, 'turn-a');
+assert.equal(
+  read.request.params.arguments[gateway.CAPABILITY_ARGUMENT],
+  undefined,
+  'capability must be stripped before upstream',
+);
 
-const search = gateway.authorizeToolCall(state, DEVICE, {
-  method: 'tools/call',
-  params: {
-    name: 'github-review.search_code',
-    arguments: { query: 'PaymentService repo:Adiuse/shaahane-monorepo' },
-  },
-}, now);
-assert.equal(search.ok, true);
+for (const [field, badValue] of [
+  ['sessionId', 'session-b'],
+  ['capabilityId', 'cap-b'],
+  ['capabilityToken', 'd'.repeat(64)],
+  ['jobId', 'job-b'],
+  ['userTurnId', 'turn-b'],
+  ['originTabId', 43],
+  ['sourcePath', '/c/review-b'],
+  ['serverId', 'other-server'],
+]) {
+  const denied = gateway.authorizeToolCall(state, DEVICE, toolRequest('get_me', {}, { [field]: badValue }), now);
+  assert.equal(denied.ok, false, `${field} mismatch must deny`);
+}
 
-assert.equal(gateway.authorizeToolCall(state, '', {
-  method: 'tools/call',
-  params: { name: 'github-review.get_file_contents', arguments: { owner: 'Adiuse', repo: 'shaahane-monorepo' } },
-}, now).ok, false, 'PAT/upstream access without the extension device credential must fail');
+assert.equal(
+  gateway.authorizeToolCall(
+    state,
+    DEVICE,
+    {
+      method: 'tools/call',
+      params: { name: 'get_me', arguments: {} },
+    },
+    now,
+  ).ok,
+  false,
+  'device credential without a per-call capability must deny',
+);
+assert.equal(
+  gateway.authorizeToolCall(
+    state,
+    DEVICE,
+    toolRequest('filesystem__get_file_contents', { owner: 'Adiuse', repo: 'shaahane-monorepo' }),
+    now,
+  ).ok,
+  false,
+  'a same-suffix tool from another MCP server must not gain GitHub provenance',
+);
+assert.equal(
+  gateway.authorizeToolCall(
+    state,
+    DEVICE,
+    toolRequest('get_file_contents', { owner: 'Adiuse', repo: 'MCP-SuperAssistant', path: 'README.md' }),
+    now,
+  ).ok,
+  false,
+  'repo escape must deny',
+);
 
-assert.equal(gateway.authorizeToolCall(state, 'b'.repeat(64), {
-  method: 'tools/call',
-  params: { name: 'github-review.get_file_contents', arguments: { owner: 'Adiuse', repo: 'shaahane-monorepo' } },
-}, now).ok, false, 'an unregistered device must not borrow another device lease');
+for (const query of [
+  'secret repo:Adiuse/MCP-SuperAssistant',
+  'PaymentService repo:Adiuse/shaahane-monorepo OR secret',
+  'PaymentService NOT secret repo:Adiuse/shaahane-monorepo',
+  'PaymentService repo:Adiuse/shaahane-monorepo trailing',
+]) {
+  assert.equal(
+    gateway.authorizeToolCall(state, DEVICE, toolRequest('search_code', { query }), now).ok,
+    false,
+    `search escape must deny: ${query}`,
+  );
+}
+assert.equal(
+  gateway.authorizeToolCall(
+    state,
+    DEVICE,
+    toolRequest('search_code', { query: 'PaymentService repo:Adiuse/shaahane-monorepo' }),
+    now,
+  ).ok,
+  true,
+);
 
-assert.equal(gateway.authorizeToolCall(state, DEVICE, {
-  method: 'tools/call',
-  params: { name: 'github-review.get_file_contents', arguments: { owner: 'Adiuse', repo: 'MCP-SuperAssistant', path: 'README.md' } },
-}, now).ok, false, 'repo escape must fail at the gateway too');
-
-assert.equal(gateway.authorizeToolCall(state, DEVICE, {
-  method: 'tools/call',
-  params: { name: 'github-review.search_code', arguments: { query: 'secret repo:Adiuse/MCP-SuperAssistant' } },
-}, now).ok, false, 'search qualifier escape must fail at the gateway too');
-
-assert.equal(gateway.authorizeToolCall(state, DEVICE, {
-  method: 'tools/call',
-  params: { name: 'github-review.create_file', arguments: { owner: 'Adiuse', repo: 'shaahane-monorepo' } },
-}, now).ok, false, 'write tools must fail at the gateway too');
-
-assert.equal(gateway.revokeLease(state, DEVICE, 'session-a'), true);
-assert.equal(gateway.authorizeToolCall(state, DEVICE, {
-  method: 'tools/call',
-  params: { name: 'github-review.get_me', arguments: {} },
-}, now).ok, false, 'revoke must close the proxy gate immediately');
-
-gateway.registerLease(state, DEVICE, {
-  sessionId: 'session-expiring',
-  capabilityId: 'cap-expiring',
-  jobId: 'job-expiring',
-  userTurnId: 'turn-expiring',
-  owner: 'Adiuse',
-  repo: 'shaahane-monorepo',
-  originTabId: 42,
-  sourcePath: '/c/review-a',
-  expiresAt: now + 1_000,
-  readOnly: true,
-  allowedTools: [...gateway.ALLOWED_TOOLS],
+let upstreamCalls = 0;
+let lastUpstreamRpc = null;
+const upstream = http.createServer(async (req, res) => {
+  upstreamCalls += 1;
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const body = Buffer.concat(chunks).toString('utf8');
+  lastUpstreamRpc = body ? JSON.parse(body) : null;
+  const requestedPath = lastUpstreamRpc?.params?.arguments?.path;
+  const response =
+    requestedPath === 'oversized'
+      ? Buffer.alloc(gateway.MAX_SINGLE_RESPONSE_BYTES + 1, 120)
+      : Buffer.from(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: lastUpstreamRpc?.id,
+            result: { content: [{ type: 'text', text: '# ok' }] },
+          }),
+        );
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(response);
 });
-assert.equal(gateway.authorizeToolCall(state, DEVICE, {
-  method: 'tools/call',
-  params: { name: 'github-review.get_me', arguments: {} },
-}, now + 2_000).ok, false, 'expiry must be enforced independently by the gateway clock');
+await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+const upstreamPort = upstream.address().port;
 
-assert.match(
-  launcher,
-  /HOST_BIND="\$\{MCP_GATEWAY_HOST_BIND:-127\.0\.0\.1\}"/,
-  'the only host-published Code Review endpoint must bind to host loopback by default',
-);
-assert.match(
-  launcher,
-  /--publish "\$\{HOST_BIND\}:\$\{GATEWAY_PORT\}:38106"/,
-  'launcher must publish only the capability-gated front door',
-);
-assert.doesNotMatch(
-  launcher,
-  /38107/,
-  'the PAT-bearing upstream proxy port must never be published or managed in the host launcher',
-);
-assert.doesNotMatch(
-  launcher,
-  /src=\$\{(?:CONFIG_PATH|GITHUB_ENV_PATH)\}/,
-  'neither MCP config nor GitHub credential may be bind-mounted from the host into the capability runtime',
-);
-assert.match(
-  launcher,
-  /--tmpfs "\/run\/bootstrap:rw,noexec,nosuid,nodev,mode=0700"/,
-  'MCP config and GitHub credential must land only in a container-local tmpfs bootstrap area',
-);
-assert.match(
-  launcher,
-  /CONFIG_BYTES="\$\(wc -c < "\$CONFIG_PATH"[\s\S]*cat "\$CONFIG_PATH"[\s\S]*cat "\$GITHUB_ENV_PATH"[\s\S]*MCP_BOOTSTRAP_CONFIG_BYTES=\$\{CONFIG_BYTES\}[\s\S]*dd iflag=fullblock bs=1 count="\$MCP_BOOTSTRAP_CONFIG_BYTES" of=\/run\/bootstrap\/config\.json[\s\S]*cat > \/run\/bootstrap\/github\.env/,
-  'launcher must frame config by byte count and stream config + GitHub credential over stdin into container tmpfs',
-);
-assert.doesNotMatch(
-  launcher,
-  /--env(?:-file)?[^\n]*GITHUB/,
-  'GitHub PAT must not be passed in Docker command arguments or container environment configuration',
-);
-assert.match(
-  entrypoint,
-  /CONFIG_PATH="\$\{MCP_SUPERASSISTANT_CONFIG:-\/run\/bootstrap\/config\.json\}"/,
-  'proxy config must default to the streamed container-tmpfs copy',
-);
-assert.match(
-  entrypoint,
-  /GITHUB_ENV_PATH="\$\{MCP_SUPERASSISTANT_GITHUB_ENV:-\/run\/bootstrap\/github\.env\}"/,
-  'GitHub credential must default to the streamed container-tmpfs copy',
-);
-assert.match(
-  entrypoint,
-  /UPSTREAM_PORT="\$\{MCP_UPSTREAM_PORT:-38107\}"/,
-  'the PAT-bearing proxy remains an internal runtime endpoint',
-);
-assert.match(
-  entrypoint,
-  /GATEWAY_INTERNAL_PORT="\$\{MCP_GATEWAY_INTERNAL_PORT:-38108\}"/,
-  'the capability gateway itself must remain on container loopback behind the public forwarder',
-);
-assert.match(
-  entrypoint,
-  /MCP_GATEWAY_HOST="127\.0\.0\.1"/,
-  'the capability gateway must continue enforcing its loopback-only client invariant inside the container',
-);
-assert.match(
-  entrypoint,
-  /TCP-LISTEN:\$\{PUBLIC_PORT\}.*TCP:127\.0\.0\.1:\$\{GATEWAY_INTERNAL_PORT\}/s,
-  'the published port must forward only to the loopback capability gateway, never to the PAT proxy',
-);
-assert.doesNotMatch(
-  dockerfile,
-  /apt-get install[^\n]*docker\.io/,
-  'secure runtime must not install Debian docker.io because its client API can be older than the host daemon minimum',
-);
-assert.match(
-  dockerfile,
-  /ARG DOCKER_CLI_VERSION=27\.5\.1/,
-  'secure runtime Docker CLI must be pinned to a modern API-compatible release',
-);
-assert.match(
-  dockerfile,
-  /download\.docker\.com\/linux\/static\/stable\/\$\{docker_arch\}\/docker-\$\{DOCKER_CLI_VERSION\}\.tgz/,
-  'secure runtime must install the pinned Docker CLI from Docker static releases rather than distro docker.io',
-);
-assert.match(
-  dockerfile,
-  /amd64\) docker_arch='x86_64'[\s\S]*arm64\) docker_arch='aarch64'/,
-  'secure runtime Docker CLI download must map supported BuildKit architectures explicitly',
-);
-assert.match(
-  dockerfile,
-  /docker --version/,
-  'secure runtime image build must verify that the modern Docker CLI is installed',
-);
+const httpState = gateway.createGatewayState();
+const httpLease = gateway.registerLease(httpState, DEVICE, leasePayload());
+const server = gateway.createCapabilityGatewayServer({
+  state: httpState,
+  upstreamUrl: `http://127.0.0.1:${upstreamPort}/mcp`,
+});
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+const gatewayPort = server.address().port;
+const endpoint = `http://127.0.0.1:${gatewayPort}/mcp`;
 
-console.log('✓ Capability gateway requires an extension credential + active prompt-bound lease and re-enforces read-only repo scope');
-console.log('✓ PAT-bearing MCP proxy has no host-published port; host traffic can reach only the capability-gated front door');
-console.log('✓ MCP config and GitHub credential are streamed into container tmpfs without host bind-mount permission weakening');
-console.log('✓ Secure runtime pins a modern Docker CLI instead of Debian docker.io to avoid host-daemon API incompatibility');
+async function rpcFetch(rpc, device = DEVICE) {
+  return fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-mcp-superassistant-device': device },
+    body: JSON.stringify(rpc),
+  });
+}
+
+let response = await rpcFetch({ jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: 'repo://secret' } });
+assert.equal(response.status, 403);
+assert.equal(upstreamCalls, 0, 'resource/custom MCP methods must be denied before upstream');
+
+response = await rpcFetch({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'get_me', arguments: {} } });
+assert.equal(response.status, 403);
+assert.equal(upstreamCalls, 0, 'tools/call without per-call lease must be denied before upstream');
+
+response = await rpcFetch(
+  toolRequest('github-review__get_file_contents', {
+    owner: 'Adiuse',
+    repo: 'shaahane-monorepo',
+    path: 'README.md',
+  }),
+);
+assert.equal(response.status, 200);
+assert.equal(upstreamCalls, 1);
+assert.equal(lastUpstreamRpc.params.arguments[gateway.CAPABILITY_ARGUMENT], undefined);
+
+response = await rpcFetch(
+  toolRequest('get_file_contents', {
+    owner: 'Adiuse',
+    repo: 'shaahane-monorepo',
+    path: 'oversized',
+  }),
+);
+assert.equal(response.status, 413, 'single responses above 2 MB must be denied by the gateway');
+
+httpLease.responseBytes = gateway.MAX_LEASE_RESPONSE_BYTES - 1;
+response = await rpcFetch(toolRequest('get_me'));
+assert.equal(response.status, 413, 'lease response total above 25 MB must revoke at the gateway');
+assert.equal(httpState.devices.get(DEVICE).leases.has('session-a'), false);
+
+const limitState = gateway.createGatewayState();
+const limitLease = gateway.registerLease(limitState, DEVICE, leasePayload({ sessionId: 'limit-session' }));
+limitLease.callCount = gateway.MAX_TOOL_CALLS;
+const limitRequest = toolRequest('get_me', {}, { sessionId: 'limit-session' });
+assert.equal(gateway.authorizeToolCall(limitState, DEVICE, limitRequest, now).status, 429);
+assert.equal(limitState.devices.get(DEVICE).leases.has('limit-session'), false);
+
+await new Promise(resolve => server.close(resolve));
+await new Promise(resolve => upstream.close(resolve));
+
+assert.match(launcher, /HOST_BIND="127\.0\.0\.1"/);
+assert.match(launcher, /GATEWAY_PORT="38106"/);
+assert.match(launcher, /--publish "127\.0\.0\.1:38106:38106"/);
+assert.match(launcher, /--read-only/);
+assert.doesNotMatch(launcher, /--mount[^\n]*docker\.sock|src=\/var\/run\/docker\.sock/);
+assert.doesNotMatch(launcher, /MCP_BOOTSTRAP_CONFIG_BYTES|cat "\$CONFIG_PATH"/);
+assert.doesNotMatch(launcher, /--env(?:-file)?[^\n]*GITHUB/);
+
+assert.match(dockerfile, /COPY --from=github-mcp \/server\/github-mcp-server \/usr\/local\/bin\/github-mcp-server/);
+assert.match(dockerfile, /USER 10001:10001/);
+assert.doesNotMatch(dockerfile, /docker-(?:cli|[0-9])|\/usr\/local\/bin\/docker/);
+assert.match(entrypoint, /CONFIG_PATH="\/opt\/mcp-superassistant\/config\.json"/);
+assert.match(entrypoint, /command -v docker[\s\S]*\/var\/run\/docker\.sock/);
+assert.doesNotMatch(entrypoint, /docker run|docker inspect/);
+assert.match(config, /"command": "\/usr\/local\/bin\/github-mcp-server"/);
+assert.doesNotMatch(config, /"command": "docker"|ghcr\.io\/github\/github-mcp-server/);
+
+console.log(
+  '✓ Gateway requires exact per-call Repo + UserTurn + Origin + Time capability and strips it before upstream',
+);
+console.log('✓ Search/provenance/custom-method escapes and gateway-side abuse ceilings fail closed');
+console.log(
+  '✓ Runtime has immutable GitHub MCP provenance, no Docker socket/CLI, and no PAT in Docker inspect configuration',
+);

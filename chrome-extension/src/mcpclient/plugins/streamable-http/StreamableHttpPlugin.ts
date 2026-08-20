@@ -2,7 +2,11 @@ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { ITransportPlugin, PluginMetadata, PluginConfig } from '../../types/plugin.js';
-import { getCodeReviewGatewayTransportHeaders } from '../../../security/codeReviewGatewayCapability.js';
+import {
+  SECURE_CODE_REVIEW_GATEWAY_URL,
+  getCodeReviewGatewayTransportHeaders,
+  isCanonicalCodeReviewGateway,
+} from '../../../security/codeReviewGatewayCapability.js';
 import { createLogger } from '@extension/shared/lib/logger';
 
 const logger = createLogger('StreamableHttpPlugin');
@@ -13,7 +17,7 @@ export class StreamableHttpPlugin implements ITransportPlugin {
     version: '1.0.0',
     transportType: 'streamable-http',
     description: 'Streamable HTTP transport for MCP protocol',
-    author: 'MCP SuperAssistant'
+    author: 'MCP SuperAssistant',
   };
 
   private transport: Transport | null = null;
@@ -37,6 +41,9 @@ export class StreamableHttpPlugin implements ITransportPlugin {
 
   private async createConnection(uri: string): Promise<Transport> {
     try {
+      if (!isCanonicalCodeReviewGateway(uri, 'streamable-http')) {
+        throw new Error(`Code Review transport is security-fixed to ${SECURE_CODE_REVIEW_GATEWAY_URL}.`);
+      }
       const url = new URL(uri);
       logger.debug(`Creating Streamable HTTP transport for: ${url.toString()}`);
 
@@ -84,12 +91,7 @@ export class StreamableHttpPlugin implements ITransportPlugin {
   }
 
   isSupported(uri: string): boolean {
-    try {
-      const url = new URL(uri);
-      return url.protocol === 'http:' || url.protocol === 'https:';
-    } catch {
-      return false;
-    }
+    return isCanonicalCodeReviewGateway(uri, 'streamable-http');
   }
 
   getDefaultConfig(): PluginConfig {
@@ -135,25 +137,34 @@ export class StreamableHttpPlugin implements ITransportPlugin {
 
       if (capabilities?.resources) {
         promises.push(
-          client.listResources().then(({ resources }) => {
-            resources.forEach(item => primitives.push({ type: 'resource', value: item }));
-          }).catch(error => logger.warn('[StreamableHttpPlugin] Failed to list resources:', error)),
+          client
+            .listResources()
+            .then(({ resources }) => {
+              resources.forEach(item => primitives.push({ type: 'resource', value: item }));
+            })
+            .catch(error => logger.warn('[StreamableHttpPlugin] Failed to list resources:', error)),
         );
       }
 
       if (capabilities?.tools) {
         promises.push(
-          client.listTools().then(({ tools }) => {
-            tools.forEach(item => primitives.push({ type: 'tool', value: item }));
-          }).catch(error => logger.warn('[StreamableHttpPlugin] Failed to list tools:', error)),
+          client
+            .listTools()
+            .then(({ tools }) => {
+              tools.forEach(item => primitives.push({ type: 'tool', value: item }));
+            })
+            .catch(error => logger.warn('[StreamableHttpPlugin] Failed to list tools:', error)),
         );
       }
 
       if (capabilities?.prompts) {
         promises.push(
-          client.listPrompts().then(({ prompts }) => {
-            prompts.forEach(item => primitives.push({ type: 'prompt', value: item }));
-          }).catch(error => logger.warn('[StreamableHttpPlugin] Failed to list prompts:', error)),
+          client
+            .listPrompts()
+            .then(({ prompts }) => {
+              prompts.forEach(item => primitives.push({ type: 'prompt', value: item }));
+            })
+            .catch(error => logger.warn('[StreamableHttpPlugin] Failed to list prompts:', error)),
         );
       }
 

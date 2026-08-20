@@ -42,7 +42,10 @@ function composerText(): string {
 }
 
 function normalizedText(value: string): string {
-  return value.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  return value
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function normalizePromptFingerprint(): string {
@@ -134,7 +137,8 @@ function onTrustedClick(event: MouseEvent): void {
 
 function onTrustedKeyDown(event: KeyboardEvent): void {
   if (!event.isTrusted || isInternalSubmission()) return;
-  if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
+  if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing)
+    return;
   const target = event.target as Element | null;
   if (!target?.closest(PROMPT_SELECTOR)) return;
   registerTrustedUserSignal();
@@ -154,10 +158,19 @@ function userMessageText(message: HTMLElement): string {
 }
 
 async function userMessageKey(message: HTMLElement, text: string): Promise<string> {
-  const withId = message.closest<HTMLElement>('[data-message-id]') || message.querySelector<HTMLElement>('[data-message-id]');
+  const withId =
+    message.closest<HTMLElement>('[data-message-id]') || message.querySelector<HTMLElement>('[data-message-id]');
   const messageId = withId?.getAttribute('data-message-id')?.trim();
   if (messageId) return `id:${messageId}`.slice(0, 180);
-  return `sha256:${await sha256(text)}`;
+  // Some remote/synchronized ChatGPT messages do not expose data-message-id.
+  // Text hash alone would collapse two distinct, identical prompts into one
+  // user turn. Bind the fallback to its stable ordinal in the rendered user
+  // message sequence so a repeated prompt always creates a fresh turn while a
+  // reload of the same conversation remains deduplicated.
+  const messages = Array.from(document.querySelectorAll<HTMLElement>(USER_MESSAGE_SELECTOR));
+  const ordinal = messages.indexOf(message);
+  if (ordinal < 0) return `unresolved:${createSubmissionId()}`;
+  return `sha256:${await sha256(text)}:ordinal:${ordinal}`;
 }
 
 async function readLastMessageKeys(): Promise<Record<string, string>> {
@@ -199,9 +212,8 @@ async function scanLatestUserMessage(): Promise<void> {
     return;
   }
 
-  const linkedTrusted = recentTrustedSubmission && recentTrustedSubmission.expiresAt > Date.now()
-    ? recentTrustedSubmission.id
-    : null;
+  const linkedTrusted =
+    recentTrustedSubmission && recentTrustedSubmission.expiresAt > Date.now() ? recentTrustedSubmission.id : null;
   const submissionId = linkedTrusted || `dom:${key}`.slice(0, 200);
   const registered = await sendUserTurn(submissionId);
   if (registered) {

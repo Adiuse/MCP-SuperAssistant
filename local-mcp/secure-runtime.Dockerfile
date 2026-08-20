@@ -1,31 +1,32 @@
+ARG GITHUB_MCP_IMAGE=ghcr.io/github/github-mcp-server:latest
+FROM ${GITHUB_MCP_IMAGE} AS github-mcp
+
 FROM node:22-bookworm-slim
 
 ARG MCP_PROXY_VERSION=0.1.8
-ARG DOCKER_CLI_VERSION=27.5.1
-ARG TARGETARCH
 
 RUN set -eux; \
   apt-get update; \
-  apt-get install -y --no-install-recommends bash ca-certificates curl socat; \
+  apt-get install -y --no-install-recommends bash ca-certificates socat; \
   rm -rf /var/lib/apt/lists/*; \
-  case "${TARGETARCH:-amd64}" in \
-    amd64) docker_arch='x86_64' ;; \
-    arm64) docker_arch='aarch64' ;; \
-    *) echo "Unsupported Docker build architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-  esac; \
-  curl -fsSL "https://download.docker.com/linux/static/stable/${docker_arch}/docker-${DOCKER_CLI_VERSION}.tgz" -o /tmp/docker.tgz; \
-  tar -xzf /tmp/docker.tgz -C /tmp; \
-  install -m 0755 /tmp/docker/docker /usr/local/bin/docker; \
-  rm -rf /tmp/docker /tmp/docker.tgz; \
-  docker --version; \
-  npm install --global "@srbhptl39/mcp-superassistant-proxy@${MCP_PROXY_VERSION}"
+  npm install --global "@srbhptl39/mcp-superassistant-proxy@${MCP_PROXY_VERSION}"; \
+  groupadd --gid 10001 mcp-runtime; \
+  useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin mcp-runtime
+
+# Run the official GitHub MCP binary directly in this container. The secure
+# runtime therefore has no Docker CLI/socket and cannot create host containers.
+COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
 
 WORKDIR /opt/mcp-superassistant
 
 COPY local-mcp/code-review-capability-gateway.mjs ./code-review-capability-gateway.mjs
 COPY local-mcp/secure-runtime-entrypoint.sh ./secure-runtime-entrypoint.sh
+COPY local-mcp/config.json ./config.json
 
-RUN chmod 0755 ./secure-runtime-entrypoint.sh
+RUN chmod 0555 /usr/local/bin/github-mcp-server ./secure-runtime-entrypoint.sh \
+  && chmod 0444 ./code-review-capability-gateway.mjs ./config.json
+
+USER 10001:10001
 
 EXPOSE 38106
 

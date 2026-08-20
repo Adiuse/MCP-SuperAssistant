@@ -3,12 +3,12 @@ export interface NamedTool {
   [key: string]: any;
 }
 
-const GITHUB_NAMESPACE_PREFIX = /^(?:[a-z0-9]+[-_.:/]+)*github(?:[-_.:/]+review)?[-_.:/]+$/i;
+// The secure runtime has one immutable MCP server id: `github-review`.
+// Friendly-looking namespaces such as `github`, `mcp.github-review`, or a
+// same-suffix tool from another configurable server are not provenance.
+const GITHUB_REVIEW_NAMESPACE_PREFIX = /^github-review(?:__|[.:/])$/i;
 
-function canonicalSuffixFromGithubNamespace(
-  name: string,
-  allowedTools: readonly string[],
-): string | null {
+function canonicalSuffixFromGithubNamespace(name: string, allowedTools: readonly string[]): string | null {
   const clean = String(name || '').trim();
   if (!clean) return null;
 
@@ -23,16 +23,13 @@ function canonicalSuffixFromGithubNamespace(
     // Only known GitHub/GitHub-review namespaces may alias into the privileged
     // Code Review allowlist. A different MCP server that happens to expose a
     // similarly named tool must never acquire GitHub Code Review capability.
-    if (GITHUB_NAMESPACE_PREFIX.test(prefix)) return canonical;
+    if (GITHUB_REVIEW_NAMESPACE_PREFIX.test(prefix)) return canonical;
   }
 
   return null;
 }
 
-export function canonicalizeScopedToolName(
-  serverToolName: string,
-  allowedTools: readonly string[],
-): string | null {
+export function canonicalizeScopedToolName(serverToolName: string, allowedTools: readonly string[]): string | null {
   const allowed = new Set(allowedTools);
   const clean = String(serverToolName || '').trim();
   if (!clean) return null;
@@ -43,16 +40,11 @@ export function canonicalizeScopedToolName(
 
 /**
  * Expose only the approved canonical tool names to the model. MCP aggregators
- * may namespace the configured `github-review` server in forms such as
- * `github.get_file_contents`, `github-review__get_file_contents`, or
- * `github_review_get_file_contents`. Exact unprefixed names win. A GitHub-
- * namespaced alias is exposed only when it resolves unambiguously to one server
- * tool; ambiguous aliases are omitted entirely.
+ * may namespace the immutable `github-review` server with its exact id. Exact
+ * unprefixed names are also safe because the runtime config contains only that
+ * one baked server. Any other namespace is omitted fail-closed.
  */
-export function aliasScopedTools<T extends NamedTool>(
-  tools: readonly T[],
-  allowedTools: readonly string[],
-): T[] {
+export function aliasScopedTools<T extends NamedTool>(tools: readonly T[], allowedTools: readonly string[]): T[] {
   const grouped = new Map<string, T[]>();
 
   for (const tool of tools) {
@@ -95,9 +87,7 @@ export function resolveScopedServerToolName(
     throw new Error(`Tool '${canonicalName}' is not an approved Code Review alias`);
   }
 
-  const candidates = tools.filter(
-    tool => canonicalizeScopedToolName(tool.name, allowedTools) === canonicalName,
-  );
+  const candidates = tools.filter(tool => canonicalizeScopedToolName(tool.name, allowedTools) === canonicalName);
 
   const exact = candidates.find(tool => tool.name === canonicalName);
   if (exact) return exact.name;
@@ -106,7 +96,5 @@ export function resolveScopedServerToolName(
     throw new Error(`Approved GitHub tool '${canonicalName}' is not available from the MCP server`);
   }
 
-  throw new Error(
-    `Approved GitHub tool '${canonicalName}' is ambiguous across GitHub MCP server namespaces`,
-  );
+  throw new Error(`Approved GitHub tool '${canonicalName}' is ambiguous across GitHub MCP server namespaces`);
 }

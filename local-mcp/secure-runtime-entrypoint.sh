@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="${MCP_SUPERASSISTANT_CONFIG:-/run/bootstrap/config.json}"
-GITHUB_ENV_PATH="${MCP_SUPERASSISTANT_GITHUB_ENV:-/run/bootstrap/github.env}"
-PUBLIC_PORT="${MCP_GATEWAY_PUBLIC_PORT:-38106}"
-GATEWAY_INTERNAL_PORT="${MCP_GATEWAY_INTERNAL_PORT:-38108}"
-UPSTREAM_HOST="${MCP_UPSTREAM_HOST:-127.0.0.1}"
-UPSTREAM_PORT="${MCP_UPSTREAM_PORT:-38107}"
-UPSTREAM_URL="${MCP_UPSTREAM_URL:-http://${UPSTREAM_HOST}:${UPSTREAM_PORT}/mcp}"
+CONFIG_PATH="/opt/mcp-superassistant/config.json"
+GITHUB_ENV_PATH="/run/bootstrap/github.env"
+PUBLIC_PORT="38106"
+GATEWAY_INTERNAL_PORT="38108"
+UPSTREAM_HOST="127.0.0.1"
+UPSTREAM_PORT="38107"
+UPSTREAM_URL="http://${UPSTREAM_HOST}:${UPSTREAM_PORT}/mcp"
 
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  echo "MCP config not found inside secure runtime: $CONFIG_PATH" >&2
+if [[ ! -r "$CONFIG_PATH" ]]; then
+  echo "Immutable MCP config is missing inside secure runtime: $CONFIG_PATH" >&2
   exit 1
 fi
 
-if [[ ! -f "$GITHUB_ENV_PATH" ]]; then
-  echo "GitHub credential file not found inside secure runtime: $GITHUB_ENV_PATH" >&2
+umask 077
+cat > "$GITHUB_ENV_PATH"
+if ! grep -q '^GITHUB_PERSONAL_ACCESS_TOKEN=' "$GITHUB_ENV_PATH"; then
+  echo "GITHUB_PERSONAL_ACCESS_TOKEN was not provided to the secure runtime." >&2
   exit 1
 fi
 
@@ -25,27 +27,17 @@ source "$GITHUB_ENV_PATH"
 set +a
 
 if [[ -z "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ]]; then
-  echo "GITHUB_PERSONAL_ACCESS_TOKEN is not exported by the runtime credential file." >&2
+  echo "GITHUB_PERSONAL_ACCESS_TOKEN is empty." >&2
   exit 1
 fi
 
-if [[ ! -S /var/run/docker.sock ]]; then
-  echo "Docker socket is required so the configured github-review stdio server can be launched." >&2
+if ! command -v github-mcp-server >/dev/null 2>&1; then
+  echo "Official github-mcp-server binary is not installed in secure runtime." >&2
   exit 1
 fi
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "docker CLI is not available inside secure runtime." >&2
-  exit 1
-fi
-
-if ! command -v mcp-superassistant-proxy >/dev/null 2>&1; then
-  echo "mcp-superassistant-proxy binary is not installed in secure runtime." >&2
-  exit 1
-fi
-
-if ! command -v socat >/dev/null 2>&1; then
-  echo "socat is not available inside secure runtime." >&2
+if command -v docker >/dev/null 2>&1 || [[ -S /var/run/docker.sock ]]; then
+  echo "Secure runtime invariant failed: Docker access must not exist inside the container." >&2
   exit 1
 fi
 
@@ -60,7 +52,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[secure-code-review] Starting PAT-bearing MCP proxy on ${UPSTREAM_HOST}:${UPSTREAM_PORT}"
-echo "[secure-code-review] The PAT-bearing proxy port is NOT published to the host."
 mcp-superassistant-proxy \
   --config "$CONFIG_PATH" \
   --outputTransport streamableHttp \
@@ -75,7 +66,7 @@ if ! kill -0 "$PROXY_PID" 2>/dev/null; then
   exit 1
 fi
 
-echo "[secure-code-review] Starting capability gateway on container loopback 127.0.0.1:${GATEWAY_INTERNAL_PORT}"
+echo "[secure-code-review] Starting capability gateway on 127.0.0.1:${GATEWAY_INTERNAL_PORT}"
 MCP_GATEWAY_HOST="127.0.0.1" \
 MCP_GATEWAY_PORT="$GATEWAY_INTERNAL_PORT" \
 MCP_UPSTREAM_URL="$UPSTREAM_URL" \
@@ -88,7 +79,7 @@ if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
   exit 1
 fi
 
-echo "[secure-code-review] Exposing only the capability-gated front door on container port ${PUBLIC_PORT}"
+echo "[secure-code-review] Exposing only the gated front door on container port ${PUBLIC_PORT}"
 socat \
   "TCP-LISTEN:${PUBLIC_PORT},fork,reuseaddr,bind=0.0.0.0" \
   "TCP:127.0.0.1:${GATEWAY_INTERNAL_PORT}" &
@@ -100,5 +91,6 @@ if ! kill -0 "$SOCAT_PID" 2>/dev/null; then
   exit 1
 fi
 
-echo "[secure-code-review] Secure runtime ready. Only the capability gateway is published."
-wait -n "$PROXY_PID" "$GATEWAY_PID" "$SOCAT_PID"
+wait -n "$SOCAT_PID" "$GATEWAY_PID" "$PROXY_PID"
+echo "[secure-code-review] A required runtime process exited; shutting down fail-closed." >&2
+exit 1

@@ -1,6 +1,7 @@
 import type React from 'react';
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { injectTailwindToShadowDom } from '../../utils/shadowDom';
 
 interface PopoverPortalProps {
   children: React.ReactNode;
@@ -16,25 +17,32 @@ const PopoverPortal: React.FC<PopoverPortalProps> = ({ children, isOpen, trigger
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const dragHandleRef = useRef<HTMLDivElement>(null);
+  const portalHostRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (!portalContainer) {
-      const div = document.createElement('div');
-      div.id = 'mcp-popover-portal';
-      div.style.position = 'absolute';
-      div.style.zIndex = '10000';
-      div.style.top = '0';
-      div.style.left = '0';
-      document.body.appendChild(div);
-      setPortalContainer(div);
-    }
+    const host = document.createElement('div');
+    host.id = 'mcp-popover-portal';
+    host.style.position = 'fixed';
+    host.style.inset = '0';
+    host.style.zIndex = '2147483646';
+    host.style.pointerEvents = 'none';
+    const shadowRoot = host.attachShadow({ mode: 'closed' });
+    const div = document.createElement('div');
+    div.setAttribute('data-mcp-secure-popover-root', 'true');
+    div.style.position = 'fixed';
+    div.style.pointerEvents = 'auto';
+    shadowRoot.appendChild(div);
+    document.body.appendChild(host);
+    portalHostRef.current = host;
+    setPortalContainer(div);
+    void injectTailwindToShadowDom(shadowRoot);
 
     return () => {
-      if (portalContainer && document.body.contains(portalContainer)) {
-        document.body.removeChild(portalContainer);
-      }
+      host.remove();
+      portalHostRef.current = null;
+      setPortalContainer(null);
     };
-  }, [portalContainer]);
+  }, []);
 
   useEffect(() => {
     const updatePosition = () => {
@@ -62,7 +70,10 @@ const PopoverPortal: React.FC<PopoverPortalProps> = ({ children, isOpen, trigger
         const spaceAbove = triggerRect.top;
         const spaceBelow = availableHeight - triggerRect.bottom;
 
-        if (triggerRect.top < popoverHeight + 30 || (spaceAbove < popoverHeight + 20 && spaceBelow >= popoverHeight + 20)) {
+        if (
+          triggerRect.top < popoverHeight + 30 ||
+          (spaceAbove < popoverHeight + 20 && spaceBelow >= popoverHeight + 20)
+        ) {
           top = Math.min(triggerRect.bottom + 10, availableHeight - popoverHeight - 10);
           transform = 'translate(-50%, 0)';
           transformOrigin = 'center top';

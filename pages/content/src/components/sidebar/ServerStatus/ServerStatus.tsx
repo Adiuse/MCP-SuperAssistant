@@ -10,7 +10,6 @@ import { cn } from '@src/lib/utils';
 import { Card, CardContent } from '@src/components/ui/card';
 import { createLogger } from '@extension/shared/lib/logger';
 
-
 const logger = createLogger('ServerStatus');
 
 interface ServerStatusProps {
@@ -23,7 +22,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
     status: connectionStatus,
     isConnected,
     isReconnecting: storeIsReconnecting,
-    error: connectionError
+    error: connectionError,
   } = useConnectionStatus();
 
   const { config: serverConfig, setConfig: setServerConfig } = useServerConfig();
@@ -55,7 +54,9 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
 
   // Debug logging to track status changes
   useEffect(() => {
-    logger.debug(`Status update - connectionStatus: ${connectionStatus}, initialStatus: ${initialStatus}, final: ${status}, isConnected: ${isConnected}`);
+    logger.debug(
+      `Status update - connectionStatus: ${connectionStatus}, initialStatus: ${initialStatus}, final: ${status}, isConnected: ${isConnected}`,
+    );
   }, [connectionStatus, initialStatus, status, isConnected]);
 
   // Destructure with fallbacks in case useBackgroundCommunication fails
@@ -91,21 +92,18 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
     [communicationMethods],
   );
 
-  const getServerConfig = useCallback(
-    async () => {
-      try {
-        if (!communicationMethods.getServerConfig) {
-          throw new Error('Communication method unavailable');
-        }
-        return await communicationMethods.getServerConfig();
-      } catch (error) {
-        logMessage(`[ServerStatus] Get server config error: ${error instanceof Error ? error.message : String(error)}`);
-        setHasBackgroundError(true);
-        throw error; // Don't fallback to default, let caller handle the error
+  const getServerConfig = useCallback(async () => {
+    try {
+      if (!communicationMethods.getServerConfig) {
+        throw new Error('Communication method unavailable');
       }
-    },
-    [communicationMethods],
-  );
+      return await communicationMethods.getServerConfig();
+    } catch (error) {
+      logMessage(`[ServerStatus] Get server config error: ${error instanceof Error ? error.message : String(error)}`);
+      setHasBackgroundError(true);
+      throw error; // Don't fallback to default, let caller handle the error
+    }
+  }, [communicationMethods]);
 
   const updateServerConfig = useCallback(
     async (config: { uri: string; connectionType: ConnectionType }) => {
@@ -146,7 +144,9 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
           logMessage('[ServerStatus] Forcing immediate connection status check on mount');
           await communicationMethods.forceConnectionStatusCheck();
         } catch (error) {
-          logMessage(`[ServerStatus] Immediate status check failed: ${error instanceof Error ? error.message : String(error)}`);
+          logMessage(
+            `[ServerStatus] Immediate status check failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
       }
     };
@@ -192,7 +192,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
     const unsubscribeCallbacks: (() => void)[] = [];
 
     // Listen for connection status changes from the event bus
-    const unsubscribeConnection = eventBus.on('connection:status-changed', (data) => {
+    const unsubscribeConnection = eventBus.on('connection:status-changed', data => {
       logMessage(`[ServerStatus] Connection status event: ${data.status}${data.error ? ` (${data.error})` : ''}`);
 
       // Update local error state if there's an error
@@ -212,7 +212,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
     unsubscribeCallbacks.push(unsubscribeConnection);
 
     // Listen for context bridge events
-    const unsubscribeBridgeInvalidated = eventBus.on('context:bridge-invalidated', (data) => {
+    const unsubscribeBridgeInvalidated = eventBus.on('context:bridge-invalidated', data => {
       logMessage(`[ServerStatus] Context bridge invalidated: ${data.error}`);
       setHasBackgroundError(true);
       setStatusMessage(`Extension context invalidated: ${data.error}`);
@@ -227,7 +227,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
     unsubscribeCallbacks.push(unsubscribeBridgeRestored);
 
     // Listen for heartbeat events to monitor connection health
-    const unsubscribeHeartbeat = eventBus.on('connection:heartbeat', (data) => {
+    const unsubscribeHeartbeat = eventBus.on('connection:heartbeat', data => {
       // Update connection health indicator if needed
       logMessage(`[ServerStatus] Heartbeat received: ${data.timestamp}`);
     });
@@ -770,7 +770,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
               <Typography variant="h4" className="mb-3 text-slate-800 dark:text-slate-100 font-semibold">
                 Server Configuration
               </Typography>
-              
+
               <div className="mb-4">
                 <label htmlFor="connection-type" className="block mb-2 text-slate-600 dark:text-slate-400 font-medium">
                   Connection Type
@@ -781,15 +781,14 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                   onChange={handleConnectionTypeChange}
                   onFocus={handleConnectionTypeFocus}
                   onBlur={handleConnectionTypeBlur}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white dark:bg-slate-800 dark:border-slate-600 dark:text-slate-200 focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-600 focus:border-transparent outline-none transition-all duration-200 hover:border-slate-400 dark:hover:border-slate-500"
-                >
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white dark:bg-slate-800 dark:border-slate-600 dark:text-slate-200 focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-600 focus:border-transparent outline-none transition-all duration-200 hover:border-slate-400 dark:hover:border-slate-500">
                   <option value="sse">Server-Sent Events (SSE)</option>
                   <option value="websocket">WebSocket</option>
                   <option value="streamable-http">Streamable HTTP</option>
                 </select>
                 <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  {connectionType === 'sse' 
-                    ? 'HTTP-based streaming connection (traditional)' 
+                  {connectionType === 'sse'
+                    ? 'HTTP-based streaming connection (traditional)'
                     : connectionType === 'websocket'
                       ? 'Full-duplex WebSocket connection (faster, more features)'
                       : 'Advanced HTTP streaming (modern MCP protocol)'}
@@ -807,11 +806,7 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                   onChange={handleServerUriChange}
                   onFocus={handleServerUriFocus}
                   onBlur={handleServerUriBlur}
-                  placeholder={connectionType === 'sse' 
-                    ? "http://localhost:3006/sse" 
-                    : connectionType === 'websocket'
-                      ? "ws://localhost:3006/message"
-                      : "http://localhost:3006/mcp"}
+                  placeholder="http://127.0.0.1:38106/mcp"
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white dark:bg-slate-800 dark:border-slate-600 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-600 focus:border-transparent outline-none transition-all duration-200 hover:border-slate-400 dark:hover:border-slate-500"
                 />
                 <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
@@ -819,21 +814,31 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
                     <strong>To start MCP SuperAssistant Proxy:</strong>
                   </div>
                   <div className="bg-slate-100 dark:bg-slate-800 p-2 rounded font-mono text-xs border">
-                    npx @srbhptl39/mcp-superassistant-proxy@latest --config ./config.json --outputTransport {connectionType === 'sse' ? 'sse' : connectionType === 'websocket' ? 'ws' : 'streamableHttp'}
+                    npx @srbhptl39/mcp-superassistant-proxy@latest --config ./config.json --outputTransport{' '}
+                    {connectionType === 'sse' ? 'sse' : connectionType === 'websocket' ? 'ws' : 'streamableHttp'}
                   </div>
                   <div className="mt-2 text-xs">
                     <div className="mb-1">
                       Available transports: <code>streamableHttp</code>, <code>sse</code>, <code>ws</code>
                     </div>
                     <div className="mt-3 p-2 bg-blue-50 dark:bg-blue-900/20 rounded border border-blue-200 dark:border-blue-800">
-                      <div className="font-medium text-blue-800 dark:text-blue-200 mb-1">📡 Public Endpoints Supported:</div>
+                      <div className="font-medium text-blue-800 dark:text-blue-200 mb-1">
+                        📡 Public Endpoints Supported:
+                      </div>
                       <div className="text-blue-700 dark:text-blue-300 space-y-1">
-                        <div>• <strong>Zapier:</strong> Public MCP endpoints with CORS enabled</div>
-                        <div>• <strong>Composio:</strong> SSE and Streamable HTTP endpoints</div>
-                        <div>• <strong>Custom servers:</strong> Any MCP server with CORS headers</div>
+                        <div>
+                          • <strong>Zapier:</strong> Public MCP endpoints with CORS enabled
+                        </div>
+                        <div>
+                          • <strong>Composio:</strong> SSE and Streamable HTTP endpoints
+                        </div>
+                        <div>
+                          • <strong>Custom servers:</strong> Any MCP server with CORS headers
+                        </div>
                       </div>
                       <div className="mt-2 text-xs text-blue-600 dark:text-blue-400">
-                        <strong>Note:</strong> WebSocket connections require local servers or proxy due to browser security restrictions.
+                        <strong>Note:</strong> WebSocket connections require local servers or proxy due to browser
+                        security restrictions.
                       </div>
                     </div>
                     {/* <div className="mt-3 p-2 bg-green-50 dark:bg-green-900/20 rounded border border-green-200 dark:border-green-800">
@@ -934,15 +939,20 @@ const ServerStatus: React.FC<ServerStatusProps> = ({ status: initialStatus }) =>
 
                 <div className="flex justify-between items-center py-1">
                   <span className="font-medium text-slate-700 dark:text-slate-200">Connection Type:</span>
-                  <span className={cn(
-                    'px-2 py-1 rounded-full text-xs font-medium',
-                    connectionType === 'websocket' 
-                      ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/20 dark:text-blue-400'
+                  <span
+                    className={cn(
+                      'px-2 py-1 rounded-full text-xs font-medium',
+                      connectionType === 'websocket'
+                        ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/20 dark:text-blue-400'
+                        : connectionType === 'streamable-http'
+                          ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                          : 'bg-gray-100 text-gray-700 dark:bg-gray-900/20 dark:text-gray-400',
+                    )}>
+                    {connectionType === 'websocket'
+                      ? 'WebSocket'
                       : connectionType === 'streamable-http'
-                        ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
-                        : 'bg-gray-100 text-gray-700 dark:bg-gray-900/20 dark:text-gray-400',
-                  )}>
-                    {connectionType === 'websocket' ? 'WebSocket' : connectionType === 'streamable-http' ? 'Streamable HTTP' : 'SSE'}
+                        ? 'Streamable HTTP'
+                        : 'SSE'}
                   </span>
                 </div>
 

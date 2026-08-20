@@ -583,7 +583,7 @@ Capability Gateway 127.0.0.1:38108
         ↓
 PAT-bearing MCP Proxy :38107
         ↓
-GitHub MCP Server
+Official GitHub MCP Server binary (same isolated runtime)
         ↓
 GitHub
 ```
@@ -617,17 +617,17 @@ Search scope restrictions
 
 ### Secure Bootstrap
 
-MCP config و GitHub credential نباید برای Secure Runtime به‌صورت bind-mounted فایل معمولی یا Docker command argument منتقل شوند.
+MCP config و GitHub credential نباید برای Secure Runtime به‌صورت bind-mounted فایل معمولی یا Docker command argument منتقل شوند. Config امنیتی باید immutable و داخل Image ساخته شود تا کاربر، مدل یا یک MCP جایگزین نتواند provenance ابزارهای GitHub را تغییر دهد.
 
 روش فعلی:
 
 ```text
-Host config.json
 Host github.env
-      ↓ stdin stream
+      ↓ stdin stream (credential only)
 Container-only tmpfs /run/bootstrap
       ↓
-config.json + github.env with umask 077
+github.env with umask 077
+Immutable image-owned config.json
       ↓
 Secure Runtime starts
 ```
@@ -641,6 +641,7 @@ PAT not in Docker command arguments
 PAT not in docker inspect environment
 PAT not bind-mounted from host
 Bootstrap files exist only in container tmpfs
+MCP server command/provenance not configurable from host
 ```
 
 Secure Runtime با hardening زیر اجرا می‌شود:
@@ -648,11 +649,14 @@ Secure Runtime با hardening زیر اجرا می‌شود:
 ```text
 --cap-drop ALL
 --security-opt no-new-privileges
+--read-only container filesystem
+non-root runtime user
 container-only tmpfs for bootstrap secrets
 no host publish for PAT-bearing upstream
+no Docker socket or Docker CLI inside runtime
 ```
 
-Docker socket فقط برای اجرای GitHub MCP stdio container توسط MCP Proxy داخل Runtime در دسترس است؛ این موضوع نباید باعث publish شدن Proxy یا ایجاد یک مسیر GitHub Read خارج از Capability Gateway شود.
+GitHub MCP Server به‌صورت باینری رسمی و مستقیم داخل همان Secure Runtime اجرا می‌شود. Runtime نباید Docker socket یا Docker CLI داشته باشد؛ در نتیجه حتی compromise شدن processهای Runtime نیز مسیر ساخت container جدید، mount کردن Host یا publish کردن پورت PAT-bearing ایجاد نمی‌کند.
 
 ### Fail-Closed Network Invariant
 

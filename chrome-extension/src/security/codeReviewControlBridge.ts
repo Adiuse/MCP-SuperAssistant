@@ -15,10 +15,7 @@ import {
   saveCodeReviewPreferences,
   startCodeReviewSession,
 } from './codeReviewGate.js';
-import {
-  activateCodeReviewGatewayLease,
-  revokeCodeReviewGatewayLease,
-} from './codeReviewGatewayCapability.js';
+import { activateCodeReviewGatewayLease, revokeCodeReviewGatewayLease } from './codeReviewGatewayCapability.js';
 import {
   clearCodeReviewExpiryNotification,
   notifyCodeReviewRevoked,
@@ -192,13 +189,25 @@ async function auditNotificationResult(input: {
   });
 }
 
-async function revokeGatewayLeaseBestEffort(sessionId: string, reason: string): Promise<void> {
+function exposeSession<T extends { capabilityToken?: string }>(session: T): Omit<T, 'capabilityToken'> {
+  const { capabilityToken: _secret, ...safe } = session;
+  return safe;
+}
+
+function exposeSessions<T extends { capabilityToken?: string }>(sessions: T[]): Array<Omit<T, 'capabilityToken'>> {
+  return sessions.map(exposeSession);
+}
+
+async function revokeGatewayLeaseRequired(sessionId: string, reason: string): Promise<void> {
   try {
     await revokeCodeReviewGatewayLease(sessionId);
   } catch (error) {
-    logger.warn(
+    logger.error(
       `[CodeReviewControlBridge] Capability gateway revoke failed for ${sessionId} (${reason}):`,
       error instanceof Error ? error.message : String(error),
+    );
+    throw new Error(
+      `Gateway revoke is queued but not acknowledged; all later GitHub reads remain blocked until synchronization succeeds (${reason}).`,
     );
   }
 }
@@ -210,7 +219,7 @@ export function registerCodeReviewControlBridge(): void {
   registerCodeReviewNotificationListeners(async event => {
     const expired = await expireCodeReviewSession(event.sessionId);
     if (expired) {
-      await revokeGatewayLeaseBestEffort(expired.id, 'alarm expiry');
+      await revokeGatewayLeaseRequired(expired.id, 'alarm expiry');
       logger.debug(`[CodeReviewControlBridge] Expired session ${event.sessionId} for ${expired.owner}/${expired.repo}`);
     }
   });
@@ -244,11 +253,17 @@ export function registerCodeReviewControlBridge(): void {
             sourceUrl,
             clientSubmissionId: readClientSubmissionId(message),
           });
+          const revokeFailures: unknown[] = [];
           for (const invalidated of registered.invalidatedSessions) {
             await clearCodeReviewExpiryNotification(invalidated.id);
-            // Local Gate is already closed. Mirror that revocation to the
-            // out-of-band proxy capability table immediately.
-            await revokeGatewayLeaseBestEffort(invalidated.id, 'new real user prompt');
+            try {
+              await revokeGatewayLeaseRequired(invalidated.id, 'new real user prompt');
+            } catch (error) {
+              revokeFailures.push(error);
+            }
+          }
+          if (revokeFailures.length > 0) {
+            throw revokeFailures[0];
           }
           return {
             success: true,
@@ -274,9 +289,9 @@ export function registerCodeReviewControlBridge(): void {
           return {
             success: true,
             currentTabId: tabId,
-            session: originSession,
-            originSession,
-            sessions,
+            session: originSession ? exposeSession(originSession) : null,
+            originSession: originSession ? exposeSession(originSession) : null,
+            sessions: exposeSessions(sessions),
             currentUserTurn,
             settings,
             pendingRequests: exposedPending,
@@ -314,7 +329,7 @@ export function registerCodeReviewControlBridge(): void {
             await activateCodeReviewGatewayLease(session);
           } catch (error) {
             await revokeCodeReviewSession(session.id, 'capability gateway activation failed', approvingTabId);
-            await revokeGatewayLeaseBestEffort(session.id, 'rollback failed approval');
+            await revokeGatewayLeaseRequired(session.id, 'rollback failed approval').catch(() => undefined);
             throw new Error(
               `Secure capability gateway is not ready: ${error instanceof Error ? error.message : String(error)}`,
             );
@@ -339,9 +354,9 @@ export function registerCodeReviewControlBridge(): void {
           return {
             success: true,
             currentTabId: approvingTabId,
-            session,
-            originSession: session.approvedTabId === approvingTabId ? session : null,
-            sessions: await getActiveCodeReviewSessions(),
+            session: exposeSession(session),
+            originSession: session.approvedTabId === approvingTabId ? exposeSession(session) : null,
+            sessions: exposeSessions(await getActiveCodeReviewSessions()),
             pendingRequests: remaining,
             pendingRequest: remaining[0] || null,
           };
@@ -374,10 +389,14 @@ export function registerCodeReviewControlBridge(): void {
             : originSession;
           if (!target) throw new Error('نشست فعال Code Review برای لغو وجود ندارد.');
 
-          const revoked = await revokeCodeReviewSession(target.id, 'manual revoke from Code Review security UI', actorTabId);
+          const revoked = await revokeCodeReviewSession(
+            target.id,
+            'manual revoke from Code Review security UI',
+            actorTabId,
+          );
           if (!revoked) throw new Error('نشست انتخاب‌شده دیگر فعال نیست.');
           await clearCodeReviewExpiryNotification(revoked.id);
-          await revokeGatewayLeaseBestEffort(revoked.id, 'manual revoke');
+          await revokeGatewayLeaseRequired(revoked.id, 'manual revoke');
           const sent = await notifyCodeReviewRevoked(revoked.owner, revoked.repo);
           await auditNotificationResult({
             sent,
@@ -394,12 +413,12 @@ export function registerCodeReviewControlBridge(): void {
           return {
             success: true,
             currentTabId: actorTabId,
-            session: nextOriginSession,
-            originSession: nextOriginSession,
-            sessions: remainingSessions,
+            session: nextOriginSession ? exposeSession(nextOriginSession) : null,
+            originSession: nextOriginSession ? exposeSession(nextOriginSession) : null,
+            sessions: exposeSessions(remainingSessions),
             pendingRequests,
             pendingRequest: pendingRequests[0] || null,
-            revoked,
+            revoked: exposeSession(revoked),
           };
         }
 

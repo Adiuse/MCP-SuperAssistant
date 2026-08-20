@@ -22,10 +22,14 @@ import {
   getPendingCodeReviewRequests,
   recordCodeReviewAuditEvent,
 } from '../security/codeReviewGate.js';
+import { aliasScopedTools, resolveScopedServerToolName } from '../security/codeReviewToolAlias.js';
 import {
-  aliasScopedTools,
-  resolveScopedServerToolName,
-} from '../security/codeReviewToolAlias.js';
+  SECURE_CODE_REVIEW_GATEWAY_URL,
+  SECURE_CODE_REVIEW_TRANSPORT,
+  attachCodeReviewCapability,
+  ensureCodeReviewGatewaySynchronized,
+  isCanonicalCodeReviewGateway,
+} from '../security/codeReviewGatewayCapability.js';
 import { notifyCodeReviewAccessRequested } from '../security/codeReviewNotifications.js';
 import {
   consumeCodeReviewCallerContext,
@@ -40,12 +44,7 @@ export { McpClient, PluginRegistry, EventEmitter };
 export { SSEPlugin, WebSocketPlugin, WebSocketTransport };
 export { DEFAULT_CLIENT_CONFIG };
 
-export type {
-  ITransportPlugin,
-  PluginMetadata,
-  PluginConfig,
-  TransportType,
-} from './types/plugin.js';
+export type { ITransportPlugin, PluginMetadata, PluginConfig, TransportType } from './types/plugin.js';
 
 export type {
   ClientConfig,
@@ -112,16 +111,6 @@ export async function createMcpClient(config?: Partial<import('./types/config.js
   return client;
 }
 
-function detectTransportType(uri: string): import('./types/plugin.js').TransportType {
-  try {
-    const url = new URL(uri);
-    if (url.protocol === 'ws:' || url.protocol === 'wss:') return 'websocket';
-    return 'sse';
-  } catch {
-    return 'sse';
-  }
-}
-
 function safeSourcePath(url?: string): string | undefined {
   if (!url) return undefined;
   try {
@@ -157,8 +146,7 @@ async function executeGatedToolCall(
   // function signature. The control bridge captures that trusted sender context
   // before the legacy listener runs and we consume it here. Explicit arguments,
   // when supplied by newer callers, always take precedence.
-  const capturedContext =
-    callerTabId === undefined ? consumeCodeReviewCallerContext(toolName, args || {}) : null;
+  const capturedContext = callerTabId === undefined ? consumeCodeReviewCallerContext(toolName, args || {}) : null;
   const effectiveCallerTabId = callerTabId ?? capturedContext?.tabId;
   const effectiveSourceUrl = callerSourceUrl ?? capturedContext?.sourceUrl;
 
@@ -178,11 +166,7 @@ async function executeGatedToolCall(
 
     const wasAlreadyPending = pendingBefore.some(item => item.requestId === request.requestId);
     if (!wasAlreadyPending) {
-      const sent = await notifyCodeReviewAccessRequested(
-        request.owner,
-        request.repo,
-        request.durationMinutes,
-      );
+      const sent = await notifyCodeReviewAccessRequested(request.owner, request.repo, request.durationMinutes);
       await recordCodeReviewAuditEvent({
         timestamp: Date.now(),
         action: sent ? 'notification_sent' : 'notification_failed',
@@ -209,6 +193,9 @@ async function executeGatedToolCall(
   }
 
   // Gate authorization always uses the canonical model-visible tool name.
+  // A failed/stale gateway revocation is a hard stop. The durable revocation
+  // outbox must drain before another GitHub read can be authorized.
+  await ensureCodeReviewGatewaySynchronized();
   const authorization = await authorizeCodeReviewToolCall(
     toolName,
     args || {},
@@ -220,13 +207,10 @@ async function executeGatedToolCall(
   // Resolve the canonical approved alias back to the exact server tool only
   // after the Gate has authorized the call.
   const primitives = await client.getPrimitives(false);
-  const serverToolName = resolveScopedServerToolName(
-    primitives.tools,
-    toolName,
-    CODE_REVIEW_ALLOWED_TOOLS,
-  );
+  const serverToolName = resolveScopedServerToolName(primitives.tools, toolName, CODE_REVIEW_ALLOWED_TOOLS);
 
-  const result = await client.callTool(serverToolName, authorization.args, adapterName);
+  const gatewayArgs = attachCodeReviewCapability(authorization.args, authorization);
+  const result = await client.callTool(serverToolName, gatewayArgs, adapterName);
   return await enforceCodeReviewResultPolicy(
     toolName,
     result,
@@ -301,18 +285,14 @@ export async function callToolWithBackwardsCompatibility(
   callerTabId?: number,
   callerSourceUrl?: string,
 ): Promise<any> {
+  if (!isCanonicalCodeReviewGateway(uri, transportType || SECURE_CODE_REVIEW_TRANSPORT)) {
+    throw new Error(`Code Review MCP is security-fixed to ${SECURE_CODE_REVIEW_GATEWAY_URL} via Streamable HTTP.`);
+  }
   const client = await getGlobalClient();
-  const type = transportType || detectTransportType(uri);
+  const type = SECURE_CODE_REVIEW_TRANSPORT;
 
   if (!client.isConnected()) await client.connect({ uri, type });
-  return await executeGatedToolCall(
-    client,
-    toolName,
-    args,
-    adapterName,
-    callerTabId,
-    callerSourceUrl,
-  );
+  return await executeGatedToolCall(client, toolName, args, adapterName, callerTabId, callerSourceUrl);
 }
 
 export async function getPrimitivesWithBackwardsCompatibility(
@@ -322,8 +302,11 @@ export async function getPrimitivesWithBackwardsCompatibility(
   callerTabId?: number,
   callerSourceUrl?: string,
 ): Promise<any[]> {
+  if (!isCanonicalCodeReviewGateway(uri, transportType || SECURE_CODE_REVIEW_TRANSPORT)) {
+    throw new Error(`Code Review MCP is security-fixed to ${SECURE_CODE_REVIEW_GATEWAY_URL} via Streamable HTTP.`);
+  }
   const client = await getGlobalClient();
-  const type = transportType || detectTransportType(uri);
+  const type = SECURE_CODE_REVIEW_TRANSPORT;
 
   if (!client.isConnected()) await client.connect({ uri, type });
   return await getGatedPrimitives(client, forceRefresh, callerTabId, callerSourceUrl);
@@ -333,8 +316,11 @@ export async function forceReconnectToMcpServer(
   uri: string,
   transportType?: import('./types/plugin.js').TransportType,
 ): Promise<void> {
+  if (!isCanonicalCodeReviewGateway(uri, transportType || SECURE_CODE_REVIEW_TRANSPORT)) {
+    throw new Error(`Code Review MCP is security-fixed to ${SECURE_CODE_REVIEW_GATEWAY_URL} via Streamable HTTP.`);
+  }
   const client = await getGlobalClient();
-  const type = transportType || detectTransportType(uri);
+  const type = SECURE_CODE_REVIEW_TRANSPORT;
 
   if (client.isConnected()) await client.disconnect();
   await client.connect({ uri, type });
@@ -344,8 +330,11 @@ export async function runWithBackwardsCompatibility(
   uri: string,
   transportType?: import('./types/plugin.js').TransportType,
 ): Promise<void> {
+  if (!isCanonicalCodeReviewGateway(uri, transportType || SECURE_CODE_REVIEW_TRANSPORT)) {
+    throw new Error(`Code Review MCP is security-fixed to ${SECURE_CODE_REVIEW_GATEWAY_URL} via Streamable HTTP.`);
+  }
   const client = await getGlobalClient();
-  const type = transportType || detectTransportType(uri);
+  const type = SECURE_CODE_REVIEW_TRANSPORT;
 
   await client.connect({ uri, type });
   const primitives = await getGatedPrimitives(client, false);
@@ -381,10 +370,9 @@ export async function connectWithWebSocket(
   uri: string,
   config?: Partial<import('./types/config.js').ClientConfig>,
 ): Promise<McpClient> {
-  const client = new McpClient(config);
-  await client.initialize();
-  await client.connect({ uri, type: 'websocket' });
-  return client;
+  void uri;
+  void config;
+  throw new Error('WebSocket is disabled for prompt-bound Code Review; use the canonical Streamable HTTP gateway.');
 }
 
 export async function callToolWithWebSocket(
@@ -394,16 +382,12 @@ export async function callToolWithWebSocket(
   callerTabId?: number,
   callerSourceUrl?: string,
 ): Promise<any> {
-  const client = await getGlobalClient();
-  await client.connect({ uri, type: 'websocket' });
-  return await executeGatedToolCall(
-    client,
-    toolName,
-    args,
-    undefined,
-    callerTabId,
-    callerSourceUrl,
-  );
+  void uri;
+  void toolName;
+  void args;
+  void callerTabId;
+  void callerSourceUrl;
+  throw new Error('WebSocket is disabled for prompt-bound Code Review; use the canonical Streamable HTTP gateway.');
 }
 
 export async function getPrimitivesWithWebSocket(
@@ -412,9 +396,11 @@ export async function getPrimitivesWithWebSocket(
   callerTabId?: number,
   callerSourceUrl?: string,
 ): Promise<any[]> {
-  const client = await getGlobalClient();
-  await client.connect({ uri, type: 'websocket' });
-  return await getGatedPrimitives(client, forceRefresh, callerTabId, callerSourceUrl);
+  void uri;
+  void forceRefresh;
+  void callerTabId;
+  void callerSourceUrl;
+  throw new Error('WebSocket is disabled for prompt-bound Code Review; use the canonical Streamable HTTP gateway.');
 }
 
 export function normalizeToolsFromPrimitives(primitives: any[]): any[] {

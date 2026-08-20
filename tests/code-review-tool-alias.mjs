@@ -25,22 +25,13 @@ const { aliasScopedTools, canonicalizeScopedToolName, resolveScopedServerToolNam
   `${pathToFileURL(outfile).href}?t=${Date.now()}`
 );
 
-const allowed = [
-  'get_me',
-  'get_file_contents',
-  'search_code',
-  'list_commits',
-];
+const allowed = ['get_me', 'get_file_contents', 'search_code', 'list_commits'];
 
 const namespaceVariants = [
-  'github.get_file_contents',
   'github-review.get_file_contents',
   'github-review/get_file_contents',
   'github-review:get_file_contents',
   'github-review__get_file_contents',
-  'github_review_get_file_contents',
-  'github-review-get_file_contents',
-  'mcp.github-review__get_file_contents',
 ];
 for (const name of namespaceVariants) {
   assert.equal(
@@ -54,6 +45,9 @@ for (const unrelated of [
   'filesystem.get_file_contents',
   'other__get_file_contents',
   'githubish_get_file_contents',
+  'github.get_file_contents',
+  'github_review_get_file_contents',
+  'mcp.github-review__get_file_contents',
 ]) {
   assert.equal(
     canonicalizeScopedToolName(unrelated, allowed),
@@ -77,8 +71,14 @@ assert.deepEqual(
   allowed,
   'github-review namespaced read tools must be exposed under canonical allowlisted names',
 );
-assert.equal(exposed.some(tool => tool.name === 'create_or_update_file'), false);
-assert.equal(exposed.some(tool => tool.name === 'read_text_file'), false);
+assert.equal(
+  exposed.some(tool => tool.name === 'create_or_update_file'),
+  false,
+);
+assert.equal(
+  exposed.some(tool => tool.name === 'read_text_file'),
+  false,
+);
 
 assert.equal(
   resolveScopedServerToolName(namespaced, 'get_file_contents', allowed),
@@ -86,21 +86,18 @@ assert.equal(
   'canonical model call must resolve back to the exact proxy tool name',
 );
 
-const exactWins = [
-  { name: 'get_file_contents' },
-  { name: 'github-review__get_file_contents' },
-];
+const exactWins = [{ name: 'get_file_contents' }, { name: 'github-review__get_file_contents' }];
 assert.equal(
   resolveScopedServerToolName(exactWins, 'get_file_contents', allowed),
   'get_file_contents',
   'an exact server tool name must win over a prefixed alias',
 );
-assert.deepEqual(aliasScopedTools(exactWins, allowed).map(tool => tool.name), ['get_file_contents']);
+assert.deepEqual(
+  aliasScopedTools(exactWins, allowed).map(tool => tool.name),
+  ['get_file_contents'],
+);
 
-const unrelatedSameSuffix = [
-  { name: 'github-review__get_file_contents' },
-  { name: 'filesystem.get_file_contents' },
-];
+const unrelatedSameSuffix = [{ name: 'github-review__get_file_contents' }, { name: 'filesystem.get_file_contents' }];
 assert.equal(
   resolveScopedServerToolName(unrelatedSameSuffix, 'get_file_contents', allowed),
   'github-review__get_file_contents',
@@ -108,7 +105,7 @@ assert.equal(
 );
 
 const ambiguousGitHubAliases = [
-  { name: 'github.get_file_contents' },
+  { name: 'github-review.get_file_contents' },
   { name: 'github-review__get_file_contents' },
 ];
 assert.equal(
@@ -116,9 +113,6 @@ assert.equal(
   false,
   'multiple GitHub namespace aliases without an exact server name must remain ambiguous',
 );
-assert.throws(
-  () => resolveScopedServerToolName(ambiguousGitHubAliases, 'get_file_contents', allowed),
-  /ambiguous/i,
-);
+assert.throws(() => resolveScopedServerToolName(ambiguousGitHubAliases, 'get_file_contents', allowed), /ambiguous/i);
 
 console.log('✓ GitHub-review MCP namespace variants map safely to canonical read-only aliases');

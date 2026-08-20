@@ -5,51 +5,33 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, '..');
-const [entrypoint, gatewaySource, ssot] = await Promise.all([
+const [launcher, entrypoint, gatewaySource, ssot] = await Promise.all([
+  fs.readFile(path.join(repoRoot, 'local-mcp', 'start-secure-code-review.sh'), 'utf8'),
   fs.readFile(path.join(repoRoot, 'local-mcp', 'secure-runtime-entrypoint.sh'), 'utf8'),
   fs.readFile(path.join(repoRoot, 'local-mcp', 'code-review-capability-gateway.mjs'), 'utf8'),
   fs.readFile(path.join(repoRoot, 'docs', 'SSOT_PROMPT_BOUND_GITHUB_ACCESS_GATEWAY.md'), 'utf8'),
 ]);
 
-assert.match(
-  entrypoint,
-  /UPSTREAM_HOST="\$\{MCP_UPSTREAM_HOST:-127\.0\.0\.1\}"/,
-  'PAT-bearing MCP proxy must default to explicit IPv4 loopback inside the secure runtime',
-);
-assert.match(
-  entrypoint,
-  /UPSTREAM_URL="\$\{MCP_UPSTREAM_URL:-http:\/\/\$\{UPSTREAM_HOST\}:\$\{UPSTREAM_PORT\}\/mcp\}"/,
-  'capability gateway upstream must be derived from the explicit loopback host',
-);
-assert.match(
-  entrypoint,
-  /--host "\$UPSTREAM_HOST"[\s\S]*--port "\$UPSTREAM_PORT"/,
-  'mcp-superassistant-proxy must receive an explicit --host instead of relying on localhost resolution',
-);
-assert.doesNotMatch(
-  entrypoint,
-  /http:\/\/localhost:38107\/mcp/,
-  'secure runtime must not use ambiguous localhost for the PAT-bearing upstream path',
-);
-assert.match(
-  gatewaySource,
-  /DEFAULT_HOST = process\.env\.MCP_GATEWAY_HOST \|\| '127\.0\.0\.1'/,
-  'standalone capability gateway must also default to explicit IPv4 loopback',
-);
-assert.match(
-  gatewaySource,
-  /DEFAULT_UPSTREAM = process\.env\.MCP_UPSTREAM_URL \|\| 'http:\/\/127\.0\.0\.1:38107\/mcp'/,
-  'standalone capability gateway must not default its PAT-bearing upstream to localhost',
-);
-assert.doesNotMatch(
-  gatewaySource,
-  /http:\/\/localhost:38107\/mcp/,
-  'gateway source must not retain the ambiguous localhost upstream default',
-);
-assert.match(
-  ssot,
-  /Endpoint رسمی و Canonical روی Host:[\s\S]*http:\/\/127\.0\.0\.1:38106\/mcp/,
-  'SSOT must retain the explicit host front-door endpoint',
-);
+assert.match(launcher, /HOST_BIND="127\.0\.0\.1"/);
+assert.match(launcher, /GATEWAY_PORT="38106"/);
+assert.match(launcher, /--publish "127\.0\.0\.1:38106:38106"/);
+assert.match(launcher, /MCP_GATEWAY_HOST_BIND is security-fixed to 127\.0\.0\.1/);
+assert.doesNotMatch(launcher, /--publish "\$\{HOST_BIND\}:\$\{GATEWAY_PORT\}/);
 
-console.log('✓ Secure runtime binds host front door, gateway and PAT-bearing MCP proxy to explicit IPv4 loopback');
+assert.match(entrypoint, /UPSTREAM_HOST="127\.0\.0\.1"/);
+assert.match(entrypoint, /UPSTREAM_PORT="38107"/);
+assert.match(entrypoint, /GATEWAY_INTERNAL_PORT="38108"/);
+assert.match(entrypoint, /--host "\$UPSTREAM_HOST"[\s\S]*--port "\$UPSTREAM_PORT"/);
+assert.match(entrypoint, /MCP_GATEWAY_HOST="127\.0\.0\.1"/);
+assert.match(entrypoint, /TCP-LISTEN:\$\{PUBLIC_PORT\}.*TCP:127\.0\.0\.1:\$\{GATEWAY_INTERNAL_PORT\}/s);
+assert.doesNotMatch(entrypoint, /http:\/\/localhost/);
+
+assert.match(gatewaySource, /const DEFAULT_HOST = '127\.0\.0\.1'/);
+assert.match(gatewaySource, /MCP_GATEWAY_HOST is security-fixed to 127\.0\.0\.1/);
+assert.match(gatewaySource, /http:\/\/127\.0\.0\.1:38107\/mcp/);
+assert.doesNotMatch(gatewaySource, /http:\/\/localhost:38107\/mcp/);
+assert.match(ssot, /Endpoint رسمی و Canonical روی Host:[\s\S]*http:\/\/127\.0\.0\.1:38106\/mcp/);
+
+console.log(
+  '✓ Host/front-door, internal gateway and PAT proxy bindings are explicit IPv4 loopback and non-overridable',
+);

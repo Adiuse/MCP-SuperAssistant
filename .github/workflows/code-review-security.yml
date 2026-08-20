@@ -41,3 +41,5 @@ jobs:
         run: pnpm exec node tests/mcp-connection-settings-contract.mjs
       - name: Run secure runtime IPv4 loopback contract
         run: pnpm exec node tests/secure-runtime-loopback-contract.mjs
+      - name: Run eleven-finding hardening contract
+        run: pnpm exec node tests/code-review-hardening-contract.mjs

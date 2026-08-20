@@ -30,6 +30,12 @@ assert.match(
   /if \(!containsReviewRequestCall\(source\.textContent \|\| ''\)\) return;[\s\S]{0,700}?void executeObservedReviewRequest\(source\)/,
   'only a parsed, real model function call may create the Pending Request',
 );
+assert.match(
+  headless,
+  /if \(!isAssistantModelOutput\(source\)\) return;/,
+  'page/user-authored pre blocks must not spoof a model access request',
+);
+assert.match(headless, /\[data-message-author-role="assistant"\]/);
 
 assert.match(
   headless,
@@ -117,4 +123,6 @@ console.log('✓ Real DOM request call creates Pending independently of general 
 console.log('✓ Origin session, not global visibility, controls the per-tab tool set');
 console.log('✓ Headless conversation identity is pathname-only and approval continuation is prompt-bound');
 console.log('✓ Instruction template remains intentionally non-executable');
-console.log('✓ Approved Code Review resumes with a compact prompt-bound tool delta instead of duplicating the full initial instructions');
+console.log(
+  '✓ Approved Code Review resumes with a compact prompt-bound tool delta instead of duplicating the full initial instructions',
+);

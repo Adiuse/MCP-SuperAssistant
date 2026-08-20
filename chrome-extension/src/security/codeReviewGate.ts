@@ -80,6 +80,7 @@ export interface CodeReviewSession {
   jobId: string;
   userTurnId: string;
   capabilityId: string;
+  capabilityToken: string;
   startedAt: number;
   expiresAt: number;
   durationMinutes: CodeReviewDurationMinutes;
@@ -147,6 +148,9 @@ export interface AuthorizedCodeReviewToolCall {
   jobId: string;
   userTurnId: string;
   capabilityId: string;
+  capabilityToken: string;
+  originTabId: number;
+  sourcePath: string;
 }
 
 export interface RegisterUserTurnResult {
@@ -176,6 +180,12 @@ function createId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+function createCapabilityToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+}
+
 function validateRepository(ownerInput: unknown, repoInput: unknown): { owner: string; repo: string } {
   const owner = typeof ownerInput === 'string' ? ownerInput.trim() : '';
   const repo = typeof repoInput === 'string' ? repoInput.trim() : '';
@@ -194,7 +204,10 @@ function validateDuration(value: unknown): CodeReviewDurationMinutes {
 
 function sanitizeOptionalString(value: unknown, maxLength: number): string | undefined {
   if (typeof value !== 'string') return undefined;
-  const clean = value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, maxLength);
+  const clean = value
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim()
+    .slice(0, maxLength);
   return clean || undefined;
 }
 
@@ -340,9 +353,11 @@ function normalizeStoredSession(raw: any): CodeReviewSession | null {
     const jobId = sanitizeOptionalString(raw.jobId, 200);
     const userTurnId = sanitizeOptionalString(raw.userTurnId, 200);
     const capabilityId = sanitizeOptionalString(raw.capabilityId, 200);
+    const capabilityToken = sanitizeOptionalString(raw.capabilityToken, 100);
     // Legacy chat-scoped sessions are intentionally dropped on upgrade. They do
     // not satisfy the prompt-bound SSOT and must fail closed.
-    if (!jobId || !userTurnId || !capabilityId) return null;
+    if (!jobId || !userTurnId || !capabilityId || !capabilityToken || !/^[a-f0-9]{64}$/i.test(capabilityToken))
+      return null;
     return {
       id,
       mode: 'code_review',
@@ -355,6 +370,7 @@ function normalizeStoredSession(raw: any): CodeReviewSession | null {
       jobId,
       userTurnId,
       capabilityId,
+      capabilityToken,
       startedAt: Number(raw.startedAt) || Date.now(),
       expiresAt: Number(raw.expiresAt) || 0,
       durationMinutes,
@@ -465,7 +481,9 @@ async function cleanupExpiredSessionsUnlocked(): Promise<CodeReviewSession[]> {
 
 function originMatches(session: CodeReviewSession, tabId: number | undefined, sourceUrl?: string): boolean {
   const sourcePath = sourcePathFromUrl(sourceUrl);
-  return tabId !== undefined && !!sourcePath && sameOrigin(tabId, sourcePath, session.approvedTabId, session.sourcePath);
+  return (
+    tabId !== undefined && !!sourcePath && sameOrigin(tabId, sourcePath, session.approvedTabId, session.sourcePath)
+  );
 }
 
 async function sessionMatchesCurrentTurnUnlocked(session: CodeReviewSession): Promise<boolean> {
@@ -614,12 +632,16 @@ export async function createPendingCodeReviewRequest(input: {
 
     const activeForOrigin = await getActiveSessionForOriginUnlocked(sourceTabId, sourcePath);
     if (activeForOrigin) {
-      throw new Error(`Code Review access is already active for the current prompt in ${activeForOrigin.owner}/${activeForOrigin.repo}.`);
+      throw new Error(
+        `Code Review access is already active for the current prompt in ${activeForOrigin.owner}/${activeForOrigin.repo}.`,
+      );
     }
 
     const sourceKey = `${sourceTabId}:${sourcePath}:${currentTurn.id}`;
     const existingRequests = await loadPendingRequests();
-    const existing = existingRequests.find(request => request.sourceKey === sourceKey && request.userTurnId === currentTurn.id);
+    const existing = existingRequests.find(
+      request => request.sourceKey === sourceKey && request.userTurnId === currentTurn.id,
+    );
     if (existing) return existing;
 
     const request: PendingCodeReviewRequest = {
@@ -733,6 +755,7 @@ export async function startCodeReviewSession(input: {
       jobId: pending.jobId,
       userTurnId: pending.userTurnId,
       capabilityId: createId('capability'),
+      capabilityToken: createCapabilityToken(),
       startedAt: now,
       expiresAt: now + pending.durationMinutes * 60_000,
       durationMinutes: pending.durationMinutes,
@@ -757,9 +780,21 @@ export async function startCodeReviewSession(input: {
       originTabId: session.approvedTabId,
       sourcePath: session.sourcePath,
     };
-    await appendAuditLog({ ...base, action: 'access_approved', reason: 'explicit user approval by requestId for the current user turn' });
-    await appendAuditLog({ ...base, action: 'session_started', reason: `${session.durationMinutes} minute read-only prompt-bound lease` });
-    await appendAuditLog({ ...base, action: 'job_started', reason: `${session.durationMinutes} minute read-only prompt-bound job` });
+    await appendAuditLog({
+      ...base,
+      action: 'access_approved',
+      reason: 'explicit user approval by requestId for the current user turn',
+    });
+    await appendAuditLog({
+      ...base,
+      action: 'session_started',
+      reason: `${session.durationMinutes} minute read-only prompt-bound lease`,
+    });
+    await appendAuditLog({
+      ...base,
+      action: 'job_started',
+      reason: `${session.durationMinutes} minute read-only prompt-bound job`,
+    });
     return session;
   });
 }
@@ -769,7 +804,12 @@ async function removeSessionUnlocked(sessionId: string): Promise<void> {
   await saveStoredSessions(sessions.filter(session => session.id !== sessionId));
 }
 
-async function auditSessionEnd(session: CodeReviewSession, action: 'session_revoked' | 'session_expired', reason: string, actorTabId?: number) {
+async function auditSessionEnd(
+  session: CodeReviewSession,
+  action: 'session_revoked' | 'session_expired',
+  reason: string,
+  actorTabId?: number,
+) {
   const jobAction = action === 'session_revoked' ? 'job_revoked' : 'job_expired';
   const base = {
     timestamp: Date.now(),
@@ -881,11 +921,17 @@ function sanitizeSearchCodeQuery(query: unknown, session: CodeReviewSession): st
   if (/\b(?:repo|org|user|owner):/i.test(query)) {
     throw new Error('Repository/org/user scope qualifiers are managed exclusively by the Code Review gate');
   }
-  if (/\bOR\b/i.test(query)) throw new Error('OR queries are disabled in gated Code Review search; use separate searches instead');
+  if (/\b(?:OR|NOT)\b/.test(query)) {
+    throw new Error('OR/NOT queries are disabled in gated Code Review search; use separate searches instead');
+  }
   return `${query.trim()} repo:${session.owner}/${session.repo}`;
 }
 
-function enforceRepoScope(toolName: string, args: Record<string, any>, session: CodeReviewSession): Record<string, any> {
+function enforceRepoScope(
+  toolName: string,
+  args: Record<string, any>,
+  session: CodeReviewSession,
+): Record<string, any> {
   const nextArgs = { ...args };
   if (SEARCH_QUERY_TOOLS.has(toolName)) {
     nextArgs.query = sanitizeSearchCodeQuery(nextArgs.query, session);
@@ -949,7 +995,9 @@ export async function authorizeCodeReviewToolCall(
     }
 
     const sessions = await loadStoredSessions();
-    await saveStoredSessions(sessions.map(item => (item.id === session.id ? { ...item, callCount: item.callCount + 1 } : item)));
+    await saveStoredSessions(
+      sessions.map(item => (item.id === session.id ? { ...item, callCount: item.callCount + 1 } : item)),
+    );
     await appendAuditLog({
       timestamp: Date.now(),
       action: 'tool_allowed',
@@ -973,6 +1021,9 @@ export async function authorizeCodeReviewToolCall(
       jobId: session.jobId,
       userTurnId: session.userTurnId,
       capabilityId: session.capabilityId,
+      capabilityToken: session.capabilityToken,
+      originTabId: session.approvedTabId,
+      sourcePath: session.sourcePath,
     };
   });
 }
@@ -1001,7 +1052,8 @@ export async function enforceCodeReviewResultPolicy(
         toolName,
         tabId: callerTabId,
         responseBytes,
-        reason: 'lease expired/revoked, origin changed, or a new real user prompt superseded this job before result delivery',
+        reason:
+          'lease expired/revoked, origin changed, or a new real user prompt superseded this job before result delivery',
       });
       throw new Error('Code Review lease ended before the tool result could be returned');
     }
@@ -1009,10 +1061,21 @@ export async function enforceCodeReviewResultPolicy(
     if (responseBytes > CODE_REVIEW_MAX_RESPONSE_BYTES) {
       const reason = `single response exceeded ${CODE_REVIEW_MAX_RESPONSE_BYTES} bytes`;
       await appendAuditLog({
-        timestamp: Date.now(), action: 'response_denied', requestId: session.sourceRequestId, sessionId: session.id,
-        jobId: session.jobId, userTurnId: session.userTurnId, capabilityId: session.capabilityId, toolName,
-        owner: session.owner, repo: session.repo, tabId: callerTabId, originTabId: session.approvedTabId,
-        sourcePath: session.sourcePath, responseBytes, reason,
+        timestamp: Date.now(),
+        action: 'response_denied',
+        requestId: session.sourceRequestId,
+        sessionId: session.id,
+        jobId: session.jobId,
+        userTurnId: session.userTurnId,
+        capabilityId: session.capabilityId,
+        toolName,
+        owner: session.owner,
+        repo: session.repo,
+        tabId: callerTabId,
+        originTabId: session.approvedTabId,
+        sourcePath: session.sourcePath,
+        responseBytes,
+        reason,
       });
       throw new Error('Tool result is too large for gated Code Review. Request a narrower file/range/query.');
     }
@@ -1022,17 +1085,30 @@ export async function enforceCodeReviewResultPolicy(
       const reason = 'job response-byte limit reached; lease revoked';
       await removeSessionUnlocked(session.id);
       await appendAuditLog({
-        timestamp: Date.now(), action: 'response_denied', requestId: session.sourceRequestId, sessionId: session.id,
-        jobId: session.jobId, userTurnId: session.userTurnId, capabilityId: session.capabilityId, toolName,
-        owner: session.owner, repo: session.repo, tabId: callerTabId, originTabId: session.approvedTabId,
-        sourcePath: session.sourcePath, responseBytes, reason,
+        timestamp: Date.now(),
+        action: 'response_denied',
+        requestId: session.sourceRequestId,
+        sessionId: session.id,
+        jobId: session.jobId,
+        userTurnId: session.userTurnId,
+        capabilityId: session.capabilityId,
+        toolName,
+        owner: session.owner,
+        repo: session.repo,
+        tabId: callerTabId,
+        originTabId: session.approvedTabId,
+        sourcePath: session.sourcePath,
+        responseBytes,
+        reason,
       });
       await auditSessionEnd(session, 'session_revoked', reason);
       throw new Error('Code Review data limit reached. This lease has been revoked.');
     }
 
     const currentSessions = await loadStoredSessions();
-    await saveStoredSessions(currentSessions.map(item => (item.id === session.id ? { ...item, responseBytes: nextTotal } : item)));
+    await saveStoredSessions(
+      currentSessions.map(item => (item.id === session.id ? { ...item, responseBytes: nextTotal } : item)),
+    );
     await appendAuditLog({
       timestamp: Date.now(),
       action: 'response_allowed',

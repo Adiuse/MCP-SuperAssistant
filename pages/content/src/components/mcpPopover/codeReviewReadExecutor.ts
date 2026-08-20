@@ -23,6 +23,7 @@ const MAX_RESULT_SUBMIT_ATTEMPTS = 3;
 const GITHUB_DEVICE_LOGIN_URL = 'https://github.com/login/device';
 const CHAT_INPUT_SELECTOR =
   '#prompt-textarea, .ProseMirror[contenteditable="true"], div[contenteditable="true"][data-id*="prompt"]';
+const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]';
 
 type ParsedReadCall = {
   toolName: string;
@@ -43,6 +44,10 @@ type StatusResponse = {
 type AutomationState = { autoExecute: boolean };
 type GitHubDeviceAuthChallenge = { verificationUrl: string; userCode?: string };
 type CachedReadResult = { key: string; result: unknown };
+type CodeReviewMcpClient = {
+  isReady?: () => boolean;
+  callTool?: (toolName: string, args: Record<string, unknown>) => Promise<unknown>;
+};
 
 declare global {
   interface Window {
@@ -52,10 +57,7 @@ declare global {
     pluginRegistry?: any;
     mcpAdapter?: any;
     getCurrentAdapter?: () => any;
-    mcpClient?: {
-      isReady?: () => boolean;
-      callTool?: (toolName: string, args: Record<string, unknown>) => Promise<unknown>;
-    };
+    mcpClient?: any;
   }
 }
 
@@ -124,6 +126,10 @@ function parseApprovedReadCall(text: string): ParsedReadCall | null {
     args[item.key] = item.value;
   }
   return { toolName: start.name, callId, args };
+}
+
+function isAssistantModelOutput(source: HTMLElement): boolean {
+  return !!source.closest(ASSISTANT_MESSAGE_SELECTOR) && !source.closest('[data-message-author-role="user"]');
 }
 
 function callKey(call: ParsedReadCall): string {
@@ -197,7 +203,7 @@ async function getOriginSession(): Promise<StatusResponse['originSession']> {
 }
 
 async function executeThroughSharedMcpClient(call: ParsedReadCall): Promise<unknown> {
-  const mcpClient = window.mcpClient;
+  const mcpClient = window.mcpClient as CodeReviewMcpClient | undefined;
   if (!mcpClient || typeof mcpClient.callTool !== 'function') throw new Error('MCP client اصلی صفحه آماده نیست.');
   if (typeof mcpClient.isReady === 'function' && !mcpClient.isReady()) {
     throw new Error('MCP client اصلی هنوز آماده اجرای ابزار نیست.');
@@ -328,6 +334,7 @@ async function executeApprovedRead(source: HTMLElement, call: ParsedReadCall): P
 function scan(): void {
   if (disposed || generalAutoExecuteEnabled()) return;
   document.querySelectorAll<HTMLElement>('.function-block .xml-results-panel pre').forEach(source => {
+    if (!isAssistantModelOutput(source)) return;
     if (source.getAttribute('data-code-review-read-executed') === 'true') return;
     if (source.getAttribute('data-code-review-read-executing') === 'true') return;
     if (source.getAttribute('data-code-review-read-final-error') === 'true') return;

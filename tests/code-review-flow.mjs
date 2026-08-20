@@ -10,9 +10,14 @@ const repoRoot = path.resolve(__dirname, '..');
 const gateEntry = path.join(repoRoot, 'chrome-extension/src/security/codeReviewGate.ts');
 const backgroundEntry = path.join(repoRoot, 'chrome-extension/src/background/index.ts');
 const bridgeEntry = path.join(repoRoot, 'chrome-extension/src/security/codeReviewControlBridge.ts');
-const headlessEntry = path.join(repoRoot, 'pages/content/src/components/sidebar/Instructions/HeadlessInstructionSync.tsx');
+const headlessEntry = path.join(
+  repoRoot,
+  'pages/content/src/components/sidebar/Instructions/HeadlessInstructionSync.tsx',
+);
 const userTurnEntry = path.join(repoRoot, 'pages/content/src/security/codeReviewUserTurn.ts');
 const securityToastEntry = path.join(repoRoot, 'pages/content/src/components/mcpPopover/securityToast.ts');
+const approvalUiEntry = path.join(repoRoot, 'pages/content/src/components/CodeReviewAccessFa.tsx');
+const gatewayCapabilityEntry = path.join(repoRoot, 'chrome-extension/src/security/codeReviewGatewayCapability.ts');
 
 function createStorageArea() {
   const data = Object.create(null);
@@ -137,6 +142,7 @@ async function runPromptBoundIsolationFlow(gate, storage) {
   assert.equal(session.userTurnId, turnA.userTurn.id);
   assert.equal(session.jobId, request.jobId);
   assert.ok(session.capabilityId);
+  assert.match(session.capabilityToken, /^[a-f0-9]{64}$/i);
 
   assert.equal((await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A_QUERY))?.id, session.id);
   assert.equal(await gate.getActiveCodeReviewSessionForOrigin(CHAT_B, URL_B), null);
@@ -147,8 +153,14 @@ async function runPromptBoundIsolationFlow(gate, storage) {
     { name: 'delete_file' },
   ];
   const chatATools = await gate.filterCodeReviewTools(serverTools, CHAT_A, URL_A_QUERY);
-  assert.deepEqual(chatATools.map(tool => tool.name), [...gate.CODE_REVIEW_ALLOWED_TOOLS]);
-  assert.equal(chatATools.some(tool => tool.name === 'delete_file'), false);
+  assert.deepEqual(
+    chatATools.map(tool => tool.name),
+    [...gate.CODE_REVIEW_ALLOWED_TOOLS],
+  );
+  assert.equal(
+    chatATools.some(tool => tool.name === 'delete_file'),
+    false,
+  );
 
   // Same approved prompt can traverse the entire repo repeatedly without a new
   // approval. This is required for architecture/E2E review.
@@ -162,13 +174,11 @@ async function runPromptBoundIsolationFlow(gate, storage) {
   assert.equal(fileAuth.userTurnId, turnA.userTurn.id);
   assert.equal(fileAuth.jobId, session.jobId);
   assert.equal(fileAuth.capabilityId, session.capabilityId);
+  assert.equal(fileAuth.capabilityToken, session.capabilityToken);
+  assert.equal(fileAuth.originTabId, CHAT_A);
+  assert.equal(fileAuth.sourcePath, '/c/code-review-a');
 
-  const searchAuth = await gate.authorizeCodeReviewToolCall(
-    'search_code',
-    { query: 'PaymentService' },
-    CHAT_A,
-    URL_A,
-  );
+  const searchAuth = await gate.authorizeCodeReviewToolCall('search_code', { query: 'PaymentService' }, CHAT_A, URL_A);
   assert.match(searchAuth.args.query, /PaymentService repo:Adiuse\/cybersecurity/);
 
   const result = await gate.enforceCodeReviewResultPolicy(
@@ -198,6 +208,10 @@ async function runPromptBoundIsolationFlow(gate, storage) {
     () => gate.authorizeCodeReviewToolCall('search_code', { query: 'secret repo:Other/repo' }, CHAT_A, URL_A),
     /scope qualifiers/i,
   );
+  await assert.rejects(
+    () => gate.authorizeCodeReviewToolCall('search_code', { query: 'secret OR private' }, CHAT_A, URL_A),
+    /OR\/NOT/i,
+  );
 
   // Attacker/new-human-prompt scenario. The old lease may still have wall-clock
   // time left, but a new real UserTurn invalidates it immediately.
@@ -209,7 +223,10 @@ async function runPromptBoundIsolationFlow(gate, storage) {
   );
   const attackerTurn = await beginHumanTurn(gate, CHAT_A, URL_A, 'human-submit-attacker');
   assert.notEqual(attackerTurn.userTurn.id, turnA.userTurn.id);
-  assert.deepEqual(attackerTurn.invalidatedSessions.map(item => item.id), [session.id]);
+  assert.deepEqual(
+    attackerTurn.invalidatedSessions.map(item => item.id),
+    [session.id],
+  );
   assert.equal(await gate.getActiveCodeReviewSessionForOrigin(CHAT_A, URL_A), null);
 
   await assert.rejects(
@@ -265,7 +282,10 @@ async function runStalePendingFlow(gate, storage) {
   await beginHumanTurn(gate, 301, URL, 'human-stale-a');
   const oldRequest = await gate.createPendingCodeReviewRequest({ sourceTabId: 301, sourcePath: '/c/stale-request' });
   const next = await beginHumanTurn(gate, 301, URL, 'human-stale-b');
-  assert.deepEqual(next.invalidatedRequests.map(item => item.requestId), [oldRequest.requestId]);
+  assert.deepEqual(
+    next.invalidatedRequests.map(item => item.requestId),
+    [oldRequest.requestId],
+  );
   assert.equal((await gate.getPendingCodeReviewRequests()).length, 0);
   await assert.rejects(
     () => gate.startCodeReviewSession({ requestId: oldRequest.requestId, approvingTabId: 301 }),
@@ -291,12 +311,14 @@ async function runRequestIdQueueFlow(gate, storage) {
 }
 
 async function runSourceContractChecks() {
-  const [background, bridge, headless, userTurn, securityToast] = await Promise.all([
+  const [background, bridge, headless, userTurn, securityToast, approvalUi, gatewayCapability] = await Promise.all([
     fs.readFile(backgroundEntry, 'utf8'),
     fs.readFile(bridgeEntry, 'utf8'),
     fs.readFile(headlessEntry, 'utf8'),
     fs.readFile(userTurnEntry, 'utf8'),
     fs.readFile(securityToastEntry, 'utf8'),
+    fs.readFile(approvalUiEntry, 'utf8'),
+    fs.readFile(gatewayCapabilityEntry, 'utf8'),
   ]);
 
   assert.equal(background.includes('broadcastToolsUpdateToContentScripts'), false);
@@ -312,11 +334,20 @@ async function runSourceContractChecks() {
 
   assert.match(bridge, /USER_TURN:\s*'code-review:user-turn'/);
   assert.match(bridge, /registerCodeReviewUserTurn\(/);
-  assert.match(bridge, /session:\s*originSession,/);
+  assert.match(bridge, /session:\s*originSession \? exposeSession\(originSession\) : null/);
   assert.doesNotMatch(bridge, /originSession\s*\|\|\s*fallbackSession/);
   assert.match(bridge, /pendingRequests\.find\(request => request\.requestId === requestId\)/);
   assert.match(bridge, /expireCodeReviewSession\(event\.sessionId\)/);
   assert.match(bridge, /clearCodeReviewExpiryNotification\(invalidated\.id\)/);
+  assert.doesNotMatch(bridge, /revokeGatewayLeaseBestEffort/);
+  assert.match(bridge, /revokeGatewayLeaseRequired/);
+  assert.match(bridge, /capabilityToken:\s*_secret/);
+
+  assert.match(background, /SECURE_CODE_REVIEW_GATEWAY_URL/);
+  assert.match(background, /config\.connectionType !== SECURE_CODE_REVIEW_TRANSPORT/);
+  assert.match(gatewayCapability, /PENDING_REVOCATIONS_STORAGE_KEY/);
+  assert.match(gatewayCapability, /ensureCodeReviewGatewaySynchronized/);
+  assert.match(gatewayCapability, /__mcp_superassistant_capability/);
 
   assert.match(userTurn, /event\.isTrusted/);
   assert.match(userTurn, /document\.addEventListener\('click',[\s\S]*true\)/);
@@ -324,7 +355,10 @@ async function runSourceContractChecks() {
   assert.doesNotMatch(userTurn, /addEventListener\('submit'/);
   assert.match(userTurn, /code-review:user-turn/);
   assert.match(userTurn, /Fail closed/);
+  assert.match(userTurn, /ordinal:\$\{ordinal\}/);
   assert.match(securityToast, /security\/codeReviewUserTurn/);
+  assert.match(approvalUi, /event\.nativeEvent\.isTrusted/);
+  assert.match(headless, /isAssistantModelOutput\(source\)/);
 
   const readToolsCheck = headless.indexOf('const hasReadTools = currentTools.some');
   const instructionsCheck = headless.indexOf('READ_TOOL_PATTERN.test(updatedInstructions)');

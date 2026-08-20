@@ -1,6 +1,12 @@
-import type { CodeReviewSession } from './codeReviewGate.js';
+import type { AuthorizedCodeReviewToolCall, CodeReviewSession } from './codeReviewGate.js';
+
+export const SECURE_CODE_REVIEW_GATEWAY_URL = 'http://127.0.0.1:38106/mcp';
+export const SECURE_CODE_REVIEW_TRANSPORT = 'streamable-http';
+export const CODE_REVIEW_SERVER_ID = 'github-review';
+export const CAPABILITY_ARGUMENT = '__mcp_superassistant_capability';
 
 const DEVICE_SECRET_STORAGE_KEY = 'mcpCodeReviewGatewayDeviceSecret';
+const PENDING_REVOCATIONS_STORAGE_KEY = 'mcpCodeReviewGatewayPendingRevocations';
 const DEVICE_HEADER = 'X-MCP-SuperAssistant-Device';
 const CONTROL_HEADER = 'X-MCP-SuperAssistant-Extension-Control';
 const CONTROL_PREFIX = '/__mcp_superassistant/code-review';
@@ -12,33 +18,19 @@ function randomSecret(): string {
   return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
 }
 
-function isSafeGatewayUrl(url: URL): boolean {
-  if (url.protocol === 'https:') return true;
-  if (url.protocol !== 'http:') return false;
-  const host = url.hostname.toLowerCase();
-  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
-}
-
-async function configuredServerUrl(): Promise<URL> {
-  const stored = await chrome.storage.local.get(['mcpServerUrl', 'mcpConnectionType']);
-  const raw = typeof stored.mcpServerUrl === 'string' ? stored.mcpServerUrl.trim() : '';
-  const connectionType = typeof stored.mcpConnectionType === 'string' ? stored.mcpConnectionType : '';
-  if (connectionType && connectionType !== 'streamable-http') {
-    throw new Error('Secure Code Review capability gateway requires Streamable HTTP transport.');
+export function isCanonicalCodeReviewGateway(uri: string, connectionType?: string): boolean {
+  if (connectionType && connectionType !== SECURE_CODE_REVIEW_TRANSPORT) return false;
+  try {
+    return new URL(uri).toString() === SECURE_CODE_REVIEW_GATEWAY_URL;
+  } catch {
+    return false;
   }
-  if (!raw) throw new Error('MCP server URL is not configured.');
-  const url = new URL(raw);
-  if (!isSafeGatewayUrl(url)) {
-    throw new Error('Code Review gateway must use HTTPS or a loopback HTTP endpoint.');
-  }
-  return url;
 }
 
 export async function getOrCreateCodeReviewGatewayDeviceSecret(): Promise<string> {
   const stored = await chrome.storage.local.get(DEVICE_SECRET_STORAGE_KEY);
-  const existing = typeof stored[DEVICE_SECRET_STORAGE_KEY] === 'string'
-    ? stored[DEVICE_SECRET_STORAGE_KEY].trim()
-    : '';
+  const existing =
+    typeof stored[DEVICE_SECRET_STORAGE_KEY] === 'string' ? stored[DEVICE_SECRET_STORAGE_KEY].trim() : '';
   if (/^[a-f0-9]{64}$/i.test(existing)) return existing;
   const created = randomSecret();
   await chrome.storage.local.set({ [DEVICE_SECRET_STORAGE_KEY]: created });
@@ -50,7 +42,7 @@ export async function getCodeReviewGatewayTransportHeaders(): Promise<Record<str
 }
 
 async function controlRequest(path: 'lease' | 'revoke', payload: Record<string, unknown>): Promise<void> {
-  const server = await configuredServerUrl();
+  const server = new URL(SECURE_CODE_REVIEW_GATEWAY_URL);
   const endpoint = new URL(`${CONTROL_PREFIX}/${path}`, server.origin);
   const deviceSecret = await getOrCreateCodeReviewGatewayDeviceSecret();
   const abortController = new AbortController();
@@ -69,7 +61,7 @@ async function controlRequest(path: 'lease' | 'revoke', payload: Record<string, 
       },
       body: JSON.stringify(payload),
     });
-    const body = await response.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+    const body = (await response.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
     if (!response.ok || body?.ok !== true) {
       throw new Error(body?.error || `Capability gateway returned HTTP ${response.status}`);
     }
@@ -83,10 +75,50 @@ async function controlRequest(path: 'lease' | 'revoke', payload: Record<string, 
   }
 }
 
+async function readPendingRevocations(): Promise<string[]> {
+  const stored = await chrome.storage.local.get(PENDING_REVOCATIONS_STORAGE_KEY);
+  const raw = stored[PENDING_REVOCATIONS_STORAGE_KEY];
+  return Array.isArray(raw)
+    ? [
+        ...new Set(
+          raw
+            .filter((value): value is string => typeof value === 'string' && !!value.trim())
+            .map(value => value.trim()),
+        ),
+      ]
+    : [];
+}
+
+async function writePendingRevocations(sessionIds: string[]): Promise<void> {
+  if (sessionIds.length === 0) {
+    await chrome.storage.local.remove(PENDING_REVOCATIONS_STORAGE_KEY);
+    return;
+  }
+  await chrome.storage.local.set({ [PENDING_REVOCATIONS_STORAGE_KEY]: [...new Set(sessionIds)].slice(-500) });
+}
+
+async function enqueueRevocation(sessionId: string): Promise<void> {
+  await writePendingRevocations([...(await readPendingRevocations()), sessionId]);
+}
+
+async function removePendingRevocation(sessionId: string): Promise<void> {
+  await writePendingRevocations((await readPendingRevocations()).filter(value => value !== sessionId));
+}
+
+export async function ensureCodeReviewGatewaySynchronized(): Promise<void> {
+  const pending = await readPendingRevocations();
+  for (const sessionId of pending) {
+    await controlRequest('revoke', { sessionId });
+    await removePendingRevocation(sessionId);
+  }
+}
+
 export async function activateCodeReviewGatewayLease(session: CodeReviewSession): Promise<void> {
+  await ensureCodeReviewGatewaySynchronized();
   await controlRequest('lease', {
     sessionId: session.id,
     capabilityId: session.capabilityId,
+    capabilityToken: session.capabilityToken,
     jobId: session.jobId,
     userTurnId: session.userTurnId,
     owner: session.owner,
@@ -95,18 +127,40 @@ export async function activateCodeReviewGatewayLease(session: CodeReviewSession)
     sourcePath: session.sourcePath,
     expiresAt: session.expiresAt,
     readOnly: true,
+    serverId: CODE_REVIEW_SERVER_ID,
     allowedTools: session.allowedTools,
   });
 }
 
 export async function revokeCodeReviewGatewayLease(sessionId: string): Promise<void> {
   if (!sessionId) return;
+  await enqueueRevocation(sessionId);
   await controlRequest('revoke', { sessionId });
+  await removePendingRevocation(sessionId);
+}
+
+export function attachCodeReviewCapability(
+  args: Record<string, unknown>,
+  authorization: AuthorizedCodeReviewToolCall,
+): Record<string, unknown> {
+  return {
+    ...args,
+    [CAPABILITY_ARGUMENT]: {
+      sessionId: authorization.sessionId,
+      capabilityId: authorization.capabilityId,
+      capabilityToken: authorization.capabilityToken,
+      jobId: authorization.jobId,
+      userTurnId: authorization.userTurnId,
+      originTabId: authorization.originTabId,
+      sourcePath: authorization.sourcePath,
+      serverId: CODE_REVIEW_SERVER_ID,
+    },
+  };
 }
 
 export const codeReviewGatewayCapabilityTestUtils = {
   DEVICE_HEADER,
   CONTROL_HEADER,
   CONTROL_PREFIX,
-  isSafeGatewayUrl,
+  PENDING_REVOCATIONS_STORAGE_KEY,
 };

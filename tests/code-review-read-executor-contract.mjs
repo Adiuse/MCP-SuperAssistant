@@ -9,10 +9,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const entry = path.join(repoRoot, 'pages/content/src/components/mcpPopover/codeReviewReadExecutor.ts');
 const adapterEntry = path.join(repoRoot, 'pages/content/src/hooks/useAdapter.ts');
-const [source, adapterSource] = await Promise.all([
-  fs.readFile(entry, 'utf8'),
-  fs.readFile(adapterEntry, 'utf8'),
-]);
+const [source, adapterSource] = await Promise.all([fs.readFile(entry, 'utf8'), fs.readFile(adapterEntry, 'utf8')]);
 
 assert.match(source, /response\.originSession/);
 assert.match(source, /window\.mcpClient/);
@@ -30,6 +27,8 @@ assert.match(
 );
 assert.match(source, /<function_result call_id=/);
 assert.match(source, /querySelectorAll<HTMLElement>\('\.function-block \.xml-results-panel pre'\)/);
+assert.match(source, /if \(!isAssistantModelOutput\(source\)\) return;/);
+assert.match(source, /\[data-message-author-role="assistant"\]/);
 assert.match(source, /MAX_EXECUTION_ATTEMPTS\s*=\s*3/);
 assert.match(source, /MAX_RESULT_SUBMIT_ATTEMPTS\s*=\s*3/);
 assert.match(source, /data-code-review-read-final-error/);
@@ -120,10 +119,10 @@ assert.equal(
 const authChallengeText =
   'Visit https://github.com/login/device and enter the code 31FC-ADD4 to authorize the GitHub MCP Server. ' +
   'After authorizing, retry your request.';
-assert.deepEqual(
-  utils.parseGitHubDeviceAuthChallenge({ content: [{ type: 'text', text: authChallengeText }] }),
-  { verificationUrl: 'https://github.com/login/device', userCode: '31FC-ADD4' },
-);
+assert.deepEqual(utils.parseGitHubDeviceAuthChallenge({ content: [{ type: 'text', text: authChallengeText }] }), {
+  verificationUrl: 'https://github.com/login/device',
+  userCode: '31FC-ADD4',
+});
 assert.equal(utils.parseGitHubDeviceAuthChallenge({ content: [{ type: 'text', text: '# README' }] }), null);
 
 console.log('✓ Approved reads preserve MCP resources, internal-mark result delivery, and suppress auth challenges');

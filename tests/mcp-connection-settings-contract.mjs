@@ -16,16 +16,14 @@ assert.match(
   /http:\/\/127\.0\.0\.1:38106\/mcp/,
   'visible MCP connection settings must expose the secure loopback gateway URL',
 );
+assert.match(settingsSource, /Streamable HTTP/, 'visible MCP connection settings must show Streamable HTTP explicitly');
 assert.match(
   settingsSource,
-  /value="streamable-http">Streamable HTTP/,
-  'visible MCP connection settings must offer Streamable HTTP explicitly',
+  /قابل تغییر نیستند/,
+  'visible MCP settings must explain that endpoint and transport are security-locked',
 );
-assert.match(
-  settingsSource,
-  /updateServerConfig\([\s\S]*connectionType[\s\S]*forceReconnect\(\)/,
-  'saving visible MCP connection settings must persist config and reconnect',
-);
+assert.doesNotMatch(settingsSource, /<input|<select|updateServerConfig/);
+assert.match(settingsSource, /event\.nativeEvent\.isTrusted/);
 assert.match(
   popoverSource,
   /<McpConnectionSettingsFa \/>/,
