@@ -4,7 +4,6 @@ import { eventBus } from '../events';
 import type { ConnectionStatus, ServerConfig } from '../types/stores';
 import { createLogger } from '@extension/shared/lib/logger';
 
-
 const logger = createLogger('useConnectionStore');
 
 export interface ConnectionState {
@@ -28,14 +27,25 @@ export interface ConnectionState {
 }
 
 const defaultServerConfig: ServerConfig = {
-  uri: 'http://localhost:3006/sse', // Default from migration guide, should be configurable
-  connectionType: 'sse',
+  uri: 'http://127.0.0.1:38106/mcp',
+  connectionType: 'streamable-http',
   timeout: 5000, // ms
   retryAttempts: 3,
   retryDelay: 2000, // ms
 };
 
-const initialState: Omit<ConnectionState, 'setStatus' | 'setServerConfig' | 'setLastError' | 'incrementAttempts' | 'resetAttempts' | 'setConnected' | 'setDisconnected' | 'startReconnecting' | 'stopReconnecting'> = {
+const initialState: Omit<
+  ConnectionState,
+  | 'setStatus'
+  | 'setServerConfig'
+  | 'setLastError'
+  | 'incrementAttempts'
+  | 'resetAttempts'
+  | 'setConnected'
+  | 'setDisconnected'
+  | 'startReconnecting'
+  | 'stopReconnecting'
+> = {
   status: 'disconnected',
   serverConfig: defaultServerConfig,
   lastConnectedAt: null,
@@ -57,8 +67,8 @@ export const useConnectionStore = create<ConnectionState>()(
       },
 
       setServerConfig: (config: Partial<ServerConfig>) => {
-        set(state => ({ 
-          serverConfig: { ...state.serverConfig, ...config }
+        set(state => ({
+          serverConfig: { ...state.serverConfig, ...config },
         }));
         logger.debug('[ConnectionStore] Server config updated:', get().serverConfig);
       },
@@ -82,7 +92,7 @@ export const useConnectionStore = create<ConnectionState>()(
         set({ connectionAttempts: 0 });
         logger.debug('[ConnectionStore] Connection attempts reset.');
       },
-      
+
       setConnected: (timestamp: number) => {
         set({
           status: 'connected',
@@ -121,8 +131,8 @@ export const useConnectionStore = create<ConnectionState>()(
         }
       },
     }),
-    { name: 'ConnectionStore', store: 'connection' } // For Redux DevTools extension
-  )
+    { name: 'ConnectionStore', store: 'connection' }, // For Redux DevTools extension
+  ),
 );
 
 // Example of how this store might be used by a connection manager service

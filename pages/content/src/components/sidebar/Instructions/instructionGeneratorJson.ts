@@ -11,6 +11,21 @@ type JsonSchema = {
   additionalProperties?: boolean;
 };
 
+const CODE_REVIEW_READ_TOOL_NAMES = new Set([
+  'get_me',
+  'get_file_contents',
+  'get_repository_tree',
+  'search_code',
+  'list_commits',
+  'get_commit',
+  'get_file_blame',
+  'list_branches',
+  'list_tags',
+  'get_tag',
+  'list_pull_requests',
+  'pull_request_read',
+]);
+
 function parseSchema(schemaText: string): JsonSchema {
   try {
     const parsed = JSON.parse(schemaText || '{}');
@@ -47,6 +62,47 @@ function renderTool(tool: InstructionTool): string {
     .join('\n');
 }
 
+function isActiveCodeReviewToolset(tools: InstructionTool[]): boolean {
+  return (
+    tools.length > 0 &&
+    tools.some(tool => CODE_REVIEW_READ_TOOL_NAMES.has(tool.name)) &&
+    tools.every(tool => CODE_REVIEW_READ_TOOL_NAMES.has(tool.name))
+  );
+}
+
+function generateActiveCodeReviewInstructions(toolList: string): string {
+  return `[MCP Code Review Session Active][IMPORTANT]
+
+The user's explicit Code Review approval is active ONLY for the real user prompt that created this review job. Continue that already-pending repository task using only the read-only MCP tools below.
+
+Prompt-bound lease rules:
+1. Internal extension messages such as \`<function_result>\` continue the SAME approved job. You may keep using the read-only tools while completing that original prompt, subject to expiry/revoke.
+2. If you receive a NEW ordinary user prompt/message after this approval, the previous lease MUST be treated as invalid for that new task even if its wall-clock timer would otherwise remain. Do NOT use these read tools for the new prompt. If the new prompt needs GitHub/repository data, call \`request_code_review_access\` after the extension re-exposes that request tool and wait for fresh approval.
+3. Never interpret a new user request as a continuation merely because it mentions the same repository or arrives before expiry.
+
+Tool-call rules for the currently approved prompt:
+4. When a tool is needed, emit exactly ONE function call and then STOP.
+5. Do NOT use ChatGPT connectors, browsing, Python, or invented tools as a substitute for these MCP tools.
+6. Never invent tool names or parameter values. The repository scope is enforced by the extension and secure gateway.
+7. After a function call, wait for the extension-provided \`<function_result>\` before continuing.
+8. Never fabricate a function result.
+
+Required JSONL call format:
+\`\`\`text
+{"type":"function_call_start","name":FUNCTION_NAME_JSON_STRING,"call_id":1}
+{"type":"description","text":"Short description of the requested action"}
+{"type":"parameter","key":PARAMETER_NAME_JSON_STRING,"value":PARAMETER_VALUE_JSON}
+{"type":"function_call_end","call_id":1}
+\`\`\`
+The template is intentionally not valid JSON until placeholders are replaced. Use zero \`parameter\` lines for tools that say \`Parameters: none\`.
+
+## Active read-only MCP tools
+
+${toolList}
+
+Continue the user's already-pending repository task now. The extension will execute valid calls and return the actual result to this conversation. A later ordinary user prompt requires a new approval before any new GitHub read.`;
+}
+
 /**
  * Generates the instruction block injected/attached to the chat so the model
  * can emit MCP function calls in the exact JSONL format understood by the
@@ -68,6 +124,16 @@ export const generateInstructionsJson = (
   }
 
   const toolList = tools.map(renderTool).join('\n\n');
+
+  // Approval changes the exposed tool set from the single request primitive to
+  // the read-only GitHub tools. HeadlessInstructionSync must send that new tool
+  // schema to the model to resume the pending task, but repeating the entire
+  // initial MCP instruction block creates a second giant visible user message.
+  // Use a small approval continuation for the active Code Review toolset.
+  if (isActiveCodeReviewToolset(tools)) {
+    return generateActiveCodeReviewInstructions(toolList);
+  }
+
   const custom =
     customInstructionsEnabled && customInstructions?.trim()
       ? `\n\n## Custom instructions\n${customInstructions.trim()}`

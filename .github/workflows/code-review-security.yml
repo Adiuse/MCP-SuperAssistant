@@ -1,0 +1,45 @@
+name: Code Review Security
+
+on:
+  push:
+    branches:
+      - agent/finalize-code-review-business-logic
+      - agent/prompt-bound-github-gateway
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+
+jobs:
+  security-flow:
+    name: Code Review security flow
+    runs-on: ubuntu-latest
+    env:
+      CEB_CI: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --prefer-offline
+      - name: Type-check Chrome extension
+        run: pnpm --filter chrome-extension type-check
+      - name: Run prompt-bound Code Review security flow
+        run: pnpm exec node tests/code-review-flow.mjs
+      - name: Run proxy capability gateway contract
+        run: pnpm exec node tests/code-review-capability-gateway.mjs
+      - name: Run Code Review DOM request contract
+        run: pnpm exec node tests/code-review-dom-request-contract.mjs
+      - name: Run namespaced GitHub tool alias contract
+        run: pnpm exec node tests/code-review-tool-alias.mjs
+      - name: Run approved read executor contract
+        run: pnpm exec node tests/code-review-read-executor-contract.mjs
+      - name: Run visible MCP connection settings contract
+        run: pnpm exec node tests/mcp-connection-settings-contract.mjs
+      - name: Run secure runtime IPv4 loopback contract
+        run: pnpm exec node tests/secure-runtime-loopback-contract.mjs
+      - name: Run eleven-finding hardening contract
+        run: pnpm exec node tests/code-review-hardening-contract.mjs

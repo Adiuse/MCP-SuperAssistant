@@ -1,20 +1,23 @@
 import {
   CODE_REVIEW_ALLOWED_DURATIONS,
   clearCodeReviewAuditLog,
-  createPendingCodeReviewRequest,
-  getActiveCodeReviewSession,
+  expireCodeReviewSession,
+  getActiveCodeReviewSessionForOrigin,
+  getActiveCodeReviewSessions,
   getCodeReviewAuditLog,
   getCodeReviewPreferences,
+  getCurrentCodeReviewUserTurnForOrigin,
   getPendingCodeReviewRequests,
   recordCodeReviewAuditEvent,
+  registerCodeReviewUserTurn,
   rejectPendingCodeReviewRequest,
   revokeCodeReviewSession,
   saveCodeReviewPreferences,
   startCodeReviewSession,
 } from './codeReviewGate.js';
+import { activateCodeReviewGatewayLease, revokeCodeReviewGatewayLease } from './codeReviewGatewayCapability.js';
 import {
   clearCodeReviewExpiryNotification,
-  notifyCodeReviewAccessRequested,
   notifyCodeReviewRevoked,
   notifyCodeReviewStarted,
   registerCodeReviewNotificationListeners,
@@ -30,6 +33,7 @@ export const CODE_REVIEW_CONTROL_MESSAGES = {
   STATUS: 'code-review:get-status',
   SETTINGS: 'code-review:get-settings',
   SAVE_SETTINGS: 'code-review:save-settings',
+  USER_TURN: 'code-review:user-turn',
   REQUEST: 'code-review:request',
   APPROVE: 'code-review:approve',
   REJECT: 'code-review:reject',
@@ -46,6 +50,7 @@ export interface CodeReviewCallerContext {
 
 let bridgeRegistered = false;
 const callerContextQueues = new Map<string, CodeReviewCallerContext[]>();
+const toolListCallerContexts: CodeReviewCallerContext[] = [];
 
 function stableSerialize(value: unknown): string {
   if (value === null || typeof value !== 'object') {
@@ -53,7 +58,6 @@ function stableSerialize(value: unknown): string {
     return serialized === undefined ? String(value) : serialized;
   }
   if (Array.isArray(value)) return `[${value.map(stableSerialize).join(',')}]`;
-
   const record = value as Record<string, unknown>;
   return `{${Object.keys(record)
     .sort()
@@ -68,24 +72,29 @@ function callerContextKey(toolName: string, args: unknown): string {
 function pruneCallerContexts(): void {
   const cutoff = Date.now() - CALLER_CONTEXT_TTL_MS;
   let total = 0;
-
   for (const [key, queue] of callerContextQueues) {
     const fresh = queue.filter(item => item.capturedAt >= cutoff);
-    if (fresh.length === 0) {
-      callerContextQueues.delete(key);
-      continue;
+    if (fresh.length === 0) callerContextQueues.delete(key);
+    else {
+      callerContextQueues.set(key, fresh);
+      total += fresh.length;
     }
-    callerContextQueues.set(key, fresh);
-    total += fresh.length;
   }
-
+  while (toolListCallerContexts.length > 0 && toolListCallerContexts[0].capturedAt < cutoff) {
+    toolListCallerContexts.shift();
+  }
+  total += toolListCallerContexts.length;
   if (total <= MAX_CALLER_CONTEXTS) return;
 
-  const all = [...callerContextQueues.entries()]
+  const allToolCalls = [...callerContextQueues.entries()]
     .flatMap(([key, queue]) => queue.map(item => ({ key, item })))
     .sort((a, b) => a.item.capturedAt - b.item.capturedAt);
-
-  for (const entry of all.slice(0, total - MAX_CALLER_CONTEXTS)) {
+  let removeCount = total - MAX_CALLER_CONTEXTS;
+  while (removeCount > 0 && toolListCallerContexts.length > 0) {
+    toolListCallerContexts.shift();
+    removeCount--;
+  }
+  for (const entry of allToolCalls.slice(0, removeCount)) {
     const queue = callerContextQueues.get(entry.key);
     if (!queue) continue;
     const index = queue.indexOf(entry.item);
@@ -94,14 +103,9 @@ function pruneCallerContexts(): void {
   }
 }
 
-function captureCodeReviewCallerContext(
-  toolName: string,
-  args: unknown,
-  sender: chrome.runtime.MessageSender,
-): void {
+function captureCodeReviewCallerContext(toolName: string, args: unknown, sender: chrome.runtime.MessageSender): void {
   const tabId = sender.tab?.id;
   if (tabId === undefined) return;
-
   pruneCallerContexts();
   const key = callerContextKey(toolName, args);
   const queue = callerContextQueues.get(key) || [];
@@ -109,30 +113,36 @@ function captureCodeReviewCallerContext(
   callerContextQueues.set(key, queue);
 }
 
-export function consumeCodeReviewCallerContext(
-  toolName: string,
-  args: unknown,
-): CodeReviewCallerContext | null {
+function captureCodeReviewToolListCallerContext(sender: chrome.runtime.MessageSender): void {
+  const tabId = sender.tab?.id;
+  if (tabId === undefined) return;
+  pruneCallerContexts();
+  toolListCallerContexts.push({ tabId, sourceUrl: sender.tab?.url, capturedAt: Date.now() });
+}
+
+export function consumeCodeReviewCallerContext(toolName: string, args: unknown): CodeReviewCallerContext | null {
   pruneCallerContexts();
   const key = callerContextKey(toolName, args);
   const queue = callerContextQueues.get(key);
   if (!queue || queue.length === 0) return null;
-
   const context = queue.shift() || null;
   if (queue.length === 0) callerContextQueues.delete(key);
   return context;
+}
+
+export function consumeCodeReviewToolListCallerContext(): CodeReviewCallerContext | null {
+  pruneCallerContexts();
+  return toolListCallerContexts.shift() || null;
 }
 
 function readSettingsPayload(message: any): { owner: string; repo: string; durationMinutes: number } {
   const owner = typeof message.payload?.owner === 'string' ? message.payload.owner.trim() : '';
   const repo = typeof message.payload?.repo === 'string' ? message.payload.repo.trim() : '';
   const durationMinutes = Number(message.payload?.durationMinutes);
-
   if (!owner || !repo) throw new Error('نام مالک و مخزن الزامی است.');
   if (!CODE_REVIEW_ALLOWED_DURATIONS.includes(durationMinutes as 5 | 10 | 20)) {
     throw new Error('مدت دسترسی باید ۵، ۱۰ یا ۲۰ دقیقه باشد.');
   }
-
   return { owner, repo, durationMinutes };
 }
 
@@ -142,14 +152,22 @@ function readRequestId(message: any): string {
   return requestId;
 }
 
-function safeSourcePath(url?: string): string | undefined {
-  if (!url) return undefined;
-  try {
-    const parsed = new URL(url);
-    return `${parsed.pathname}${parsed.search}`.slice(0, 500);
-  } catch {
-    return undefined;
-  }
+function readOptionalSessionId(message: any): string | undefined {
+  const sessionId = typeof message.payload?.sessionId === 'string' ? message.payload.sessionId.trim() : '';
+  return sessionId || undefined;
+}
+
+function readClientSubmissionId(message: any): string | undefined {
+  const id = typeof message.payload?.clientSubmissionId === 'string' ? message.payload.clientSubmissionId.trim() : '';
+  return id || undefined;
+}
+
+function exposePendingRequest<T extends { requestId: string }>(request: T): T & { id: string } {
+  return { ...request, id: request.requestId };
+}
+
+function exposePendingRequests<T extends { requestId: string }>(requests: T[]): Array<T & { id: string }> {
+  return requests.map(exposePendingRequest);
 }
 
 async function auditNotificationResult(input: {
@@ -171,19 +189,39 @@ async function auditNotificationResult(input: {
   });
 }
 
+function exposeSession<T extends { capabilityToken?: string }>(session: T): Omit<T, 'capabilityToken'> {
+  const { capabilityToken: _secret, ...safe } = session;
+  return safe;
+}
+
+function exposeSessions<T extends { capabilityToken?: string }>(sessions: T[]): Array<Omit<T, 'capabilityToken'>> {
+  return sessions.map(exposeSession);
+}
+
+async function revokeGatewayLeaseRequired(sessionId: string, reason: string): Promise<void> {
+  try {
+    await revokeCodeReviewGatewayLease(sessionId);
+  } catch (error) {
+    logger.error(
+      `[CodeReviewControlBridge] Capability gateway revoke failed for ${sessionId} (${reason}):`,
+      error instanceof Error ? error.message : String(error),
+    );
+    throw new Error(
+      `Gateway revoke is queued but not acknowledged; all later GitHub reads remain blocked until synchronization succeeds (${reason}).`,
+    );
+  }
+}
+
 export function registerCodeReviewControlBridge(): void {
   if (bridgeRegistered || typeof chrome === 'undefined' || !chrome.runtime?.onMessage) return;
   bridgeRegistered = true;
 
   registerCodeReviewNotificationListeners(async event => {
-    await recordCodeReviewAuditEvent({
-      timestamp: Date.now(),
-      action: 'notification_sent',
-      sessionId: event.sessionId,
-      owner: event.owner,
-      repo: event.repo,
-      reason: 'session_expired',
-    });
+    const expired = await expireCodeReviewSession(event.sessionId);
+    if (expired) {
+      await revokeGatewayLeaseRequired(expired.id, 'alarm expiry');
+      logger.debug(`[CodeReviewControlBridge] Expired session ${event.sessionId} for ${expired.owner}/${expired.repo}`);
+    }
   });
 
   chrome.runtime.onMessage.addListener((message: any, sender, sendResponse) => {
@@ -195,23 +233,69 @@ export function registerCodeReviewControlBridge(): void {
       return false;
     }
 
+    if (message?.type === 'mcp:get-tools') {
+      captureCodeReviewToolListCallerContext(sender);
+      return false;
+    }
+
     if (!message || typeof message.type !== 'string' || !message.type.startsWith('code-review:')) return false;
 
     const run = async () => {
       switch (message.type) {
-        case CODE_REVIEW_CONTROL_MESSAGES.STATUS: {
-          const [session, pendingRequests, settings] = await Promise.all([
-            getActiveCodeReviewSession(),
-            getPendingCodeReviewRequests(),
-            getCodeReviewPreferences(),
-          ]);
+        case CODE_REVIEW_CONTROL_MESSAGES.USER_TURN: {
+          const sourceTabId = sender.tab?.id;
+          const sourceUrl = sender.tab?.url;
+          if (sourceTabId === undefined || !sourceUrl) {
+            throw new Error('ثبت Prompt واقعی فقط از یک تب/Conversation قابل اعتماد ممکن است.');
+          }
+          const registered = await registerCodeReviewUserTurn({
+            sourceTabId,
+            sourceUrl,
+            clientSubmissionId: readClientSubmissionId(message),
+          });
+          const revokeFailures: unknown[] = [];
+          for (const invalidated of registered.invalidatedSessions) {
+            await clearCodeReviewExpiryNotification(invalidated.id);
+            try {
+              await revokeGatewayLeaseRequired(invalidated.id, 'new real user prompt');
+            } catch (error) {
+              revokeFailures.push(error);
+            }
+          }
+          if (revokeFailures.length > 0) {
+            throw revokeFailures[0];
+          }
           return {
             success: true,
-            currentTabId: sender.tab?.id,
-            session,
+            currentTabId: sourceTabId,
+            userTurn: registered.userTurn,
+            invalidatedSessionIds: registered.invalidatedSessions.map(item => item.id),
+            invalidatedRequestIds: registered.invalidatedRequests.map(item => item.requestId),
+            deduplicated: registered.deduplicated,
+          };
+        }
+
+        case CODE_REVIEW_CONTROL_MESSAGES.STATUS: {
+          const tabId = sender.tab?.id;
+          const sourceUrl = sender.tab?.url;
+          const [originSession, sessions, pendingRequests, settings, currentUserTurn] = await Promise.all([
+            getActiveCodeReviewSessionForOrigin(tabId, sourceUrl),
+            getActiveCodeReviewSessions(),
+            getPendingCodeReviewRequests(),
+            getCodeReviewPreferences(),
+            getCurrentCodeReviewUserTurnForOrigin(tabId, sourceUrl),
+          ]);
+          const exposedPending = exposePendingRequests(pendingRequests);
+          return {
+            success: true,
+            currentTabId: tabId,
+            session: originSession ? exposeSession(originSession) : null,
+            originSession: originSession ? exposeSession(originSession) : null,
+            sessions: exposeSessions(sessions),
+            currentUserTurn,
             settings,
-            pendingRequests,
-            pendingRequest: pendingRequests[0] || null,
+            pendingRequests: exposedPending,
+            pendingRequest: exposedPending[0] || null,
           };
         }
 
@@ -226,49 +310,30 @@ export function registerCodeReviewControlBridge(): void {
           return { success: true, currentTabId: sender.tab?.id, settings };
         }
 
-        case CODE_REVIEW_CONTROL_MESSAGES.REQUEST: {
-          const tabId = sender.tab?.id;
-          if (tabId === undefined) throw new Error('درخواست دسترسی فقط از داخل تب مرورگر مجاز است.');
-
-          const sourcePath = safeSourcePath(sender.tab?.url);
-          const request = await createPendingCodeReviewRequest({
-            sourceTabId: tabId,
-            sourcePath,
-            sourceKey: sourcePath ? `${tabId}:${sourcePath}` : `tab:${tabId}`,
-          });
-
-          const sent = await notifyCodeReviewAccessRequested(
-            request.owner,
-            request.repo,
-            request.durationMinutes,
-          );
-          await auditNotificationResult({
-            sent,
-            owner: request.owner,
-            repo: request.repo,
-            tabId,
-            reason: 'access_requested',
-          });
-
-          return { success: true, currentTabId: tabId, pendingRequest: request };
-        }
+        case CODE_REVIEW_CONTROL_MESSAGES.REQUEST:
+          throw new Error('درخواست دسترسی فقط از طریق ابزار request_code_review_access ایجاد می‌شود.');
 
         case CODE_REVIEW_CONTROL_MESSAGES.APPROVE: {
           const requestId = readRequestId(message);
           const approvingTabId = sender.tab?.id;
           if (approvingTabId === undefined) throw new Error('تأیید دسترسی فقط از داخل تب مرورگر مجاز است.');
-
           const pendingRequests = await getPendingCodeReviewRequests();
-          const pending = pendingRequests.find(request => request.id === requestId);
+          const pending = pendingRequests.find(request => request.requestId === requestId);
           if (!pending) throw new Error('این درخواست دیگر در صف انتظار وجود ندارد.');
 
-          const session = await startCodeReviewSession({
-            owner: pending.owner,
-            repo: pending.repo,
-            durationMinutes: pending.durationMinutes,
-            approvedTabId: approvingTabId,
-            requestId: pending.id,
-          });
+          const session = await startCodeReviewSession({ requestId: pending.requestId, approvingTabId });
+          try {
+            // Approval is not operational until the local/remote capability
+            // gateway accepted the same prompt-bound lease. PAT in the upstream
+            // proxy alone is therefore insufficient.
+            await activateCodeReviewGatewayLease(session);
+          } catch (error) {
+            await revokeCodeReviewSession(session.id, 'capability gateway activation failed', approvingTabId);
+            await revokeGatewayLeaseRequired(session.id, 'rollback failed approval').catch(() => undefined);
+            throw new Error(
+              `Secure capability gateway is not ready: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
 
           await scheduleCodeReviewExpiryNotification({
             sessionId: session.id,
@@ -276,7 +341,6 @@ export function registerCodeReviewControlBridge(): void {
             repo: session.repo,
             expiresAt: session.expiresAt,
           });
-
           const sent = await notifyCodeReviewStarted(session.owner, session.repo, session.durationMinutes);
           await auditNotificationResult({
             sent,
@@ -284,56 +348,77 @@ export function registerCodeReviewControlBridge(): void {
             owner: session.owner,
             repo: session.repo,
             tabId: session.approvedTabId,
-            reason: 'session_started',
+            reason: 'job_started',
           });
-
-          const remaining = await getPendingCodeReviewRequests();
+          const remaining = exposePendingRequests(await getPendingCodeReviewRequests());
           return {
             success: true,
             currentTabId: approvingTabId,
-            session,
+            session: exposeSession(session),
+            originSession: session.approvedTabId === approvingTabId ? exposeSession(session) : null,
+            sessions: exposeSessions(await getActiveCodeReviewSessions()),
             pendingRequests: remaining,
             pendingRequest: remaining[0] || null,
           };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REJECT: {
-          if (sender.tab?.id === undefined) throw new Error('رد درخواست فقط از داخل تب مرورگر مجاز است.');
+          const actorTabId = sender.tab?.id;
+          if (actorTabId === undefined) throw new Error('رد درخواست فقط از داخل تب مرورگر مجاز است.');
           const requestId = readRequestId(message);
-          const rejected = await rejectPendingCodeReviewRequest('explicitly rejected by user', requestId);
+          const rejected = await rejectPendingCodeReviewRequest(requestId, 'explicitly rejected by user', actorTabId);
           if (!rejected) throw new Error('این درخواست دیگر در صف انتظار وجود ندارد.');
-          const remaining = await getPendingCodeReviewRequests();
+          const remaining = exposePendingRequests(await getPendingCodeReviewRequests());
           return {
             success: true,
-            currentTabId: sender.tab.id,
+            currentTabId: actorTabId,
             pendingRequests: remaining,
             pendingRequest: remaining[0] || null,
-            rejected,
+            rejected: exposePendingRequest(rejected),
           };
         }
 
         case CODE_REVIEW_CONTROL_MESSAGES.REVOKE: {
-          if (sender.tab?.id === undefined) throw new Error('لغو دسترسی فقط از داخل تب مرورگر مجاز است.');
+          const actorTabId = sender.tab?.id;
+          if (actorTabId === undefined) throw new Error('لغو دسترسی فقط از داخل تب مرورگر مجاز است.');
+          const requestedSessionId = readOptionalSessionId(message);
+          const sessions = await getActiveCodeReviewSessions();
+          const originSession = await getActiveCodeReviewSessionForOrigin(actorTabId, sender.tab?.url);
+          const target = requestedSessionId
+            ? sessions.find(item => item.id === requestedSessionId) || null
+            : originSession;
+          if (!target) throw new Error('نشست فعال Code Review برای لغو وجود ندارد.');
 
-          const revoked = await revokeCodeReviewSession('manual global revoke from Persian Code Review UI');
-          await clearCodeReviewExpiryNotification();
-          const sent = await notifyCodeReviewRevoked(revoked?.owner, revoked?.repo);
+          const revoked = await revokeCodeReviewSession(
+            target.id,
+            'manual revoke from Code Review security UI',
+            actorTabId,
+          );
+          if (!revoked) throw new Error('نشست انتخاب‌شده دیگر فعال نیست.');
+          await clearCodeReviewExpiryNotification(revoked.id);
+          await revokeGatewayLeaseRequired(revoked.id, 'manual revoke');
+          const sent = await notifyCodeReviewRevoked(revoked.owner, revoked.repo);
           await auditNotificationResult({
             sent,
-            sessionId: revoked?.id,
-            owner: revoked?.owner,
-            repo: revoked?.repo,
-            tabId: sender.tab.id,
-            reason: 'session_revoked',
+            sessionId: revoked.id,
+            owner: revoked.owner,
+            repo: revoked.repo,
+            tabId: actorTabId,
+            reason: 'job_revoked',
           });
 
-          const pendingRequests = await getPendingCodeReviewRequests();
+          const pendingRequests = exposePendingRequests(await getPendingCodeReviewRequests());
+          const remainingSessions = await getActiveCodeReviewSessions();
+          const nextOriginSession = await getActiveCodeReviewSessionForOrigin(actorTabId, sender.tab?.url);
           return {
             success: true,
-            currentTabId: sender.tab.id,
-            session: null,
+            currentTabId: actorTabId,
+            session: nextOriginSession ? exposeSession(nextOriginSession) : null,
+            originSession: nextOriginSession ? exposeSession(nextOriginSession) : null,
+            sessions: exposeSessions(remainingSessions),
             pendingRequests,
             pendingRequest: pendingRequests[0] || null,
+            revoked: exposeSession(revoked),
           };
         }
 
@@ -362,6 +447,4 @@ export function registerCodeReviewControlBridge(): void {
 
     return true;
   });
-
-  logger.debug('[CodeReviewControlBridge] Registered');
 }

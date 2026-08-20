@@ -2,8 +2,12 @@ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { ITransportPlugin, PluginMetadata, PluginConfig } from '../../types/plugin.js';
+import {
+  SECURE_CODE_REVIEW_GATEWAY_URL,
+  getCodeReviewGatewayTransportHeaders,
+  isCanonicalCodeReviewGateway,
+} from '../../../security/codeReviewGatewayCapability.js';
 import { createLogger } from '@extension/shared/lib/logger';
-
 
 const logger = createLogger('StreamableHttpPlugin');
 
@@ -13,19 +17,17 @@ export class StreamableHttpPlugin implements ITransportPlugin {
     version: '1.0.0',
     transportType: 'streamable-http',
     description: 'Streamable HTTP transport for MCP protocol',
-    author: 'MCP SuperAssistant'
+    author: 'MCP SuperAssistant',
   };
 
   private transport: Transport | null = null;
 
   async initialize(config: PluginConfig): Promise<void> {
-    // Configuration can be used for future enhancements
     logger.debug(`Initialized with config:`, config);
   }
 
   async connect(uri: string): Promise<Transport> {
     logger.debug(`Creating transport for: ${uri}`);
-
     try {
       const transport = await this.createConnection(uri);
       this.transport = transport;
@@ -39,39 +41,40 @@ export class StreamableHttpPlugin implements ITransportPlugin {
 
   private async createConnection(uri: string): Promise<Transport> {
     try {
-      // Validate and parse URI
+      if (!isCanonicalCodeReviewGateway(uri, 'streamable-http')) {
+        throw new Error(`Code Review transport is security-fixed to ${SECURE_CODE_REVIEW_GATEWAY_URL}.`);
+      }
       const url = new URL(uri);
       logger.debug(`Creating Streamable HTTP transport for: ${url.toString()}`);
 
-      // Create streamable HTTP transport
-      const transport = new StreamableHTTPClientTransport(url);
+      // The device credential is generated/stored only inside extension storage
+      // and is transported as an HTTP header. It never appears in model-visible
+      // MCP tool schemas, arguments, results, instructions, or audit entries.
+      const gatewayHeaders = await getCodeReviewGatewayTransportHeaders();
+      const transport = new StreamableHTTPClientTransport(url, {
+        requestInit: { headers: gatewayHeaders },
+      });
 
-      // Return the transport without testing
-      // The main client will handle the connection test
-      logger.debug('[StreamableHttpPlugin] Streamable HTTP transport created successfully');
+      logger.debug('[StreamableHttpPlugin] Streamable HTTP transport created with capability-gateway credential');
       return transport;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-
-      // Enhanced error messages for Streamable HTTP-specific issues
       let enhancedError = errorMessage;
       if (errorMessage.includes('404')) {
-        enhancedError = 'Streamable HTTP endpoint not found (404). Verify the server URL and endpoint path.';
+        enhancedError = 'Streamable HTTP endpoint not found (404). Verify the secure gateway URL and endpoint path.';
       } else if (errorMessage.includes('timeout')) {
-        enhancedError = 'Streamable HTTP connection timeout. The server may be slow or unreachable.';
+        enhancedError = 'Streamable HTTP connection timeout. The secure gateway may be slow or unreachable.';
       } else if (errorMessage.includes('Failed to fetch')) {
-        enhancedError = 'Streamable HTTP connection failed. Check if the server is running and accessible.';
+        enhancedError = 'Streamable HTTP connection failed. Check if the secure capability gateway is running.';
       } else if (errorMessage.includes('protocol')) {
         enhancedError = 'Streamable HTTP protocol error. The server may not support streamable HTTP.';
       }
-
       throw new Error(`StreamableHttpPlugin: ${enhancedError}`);
     }
   }
 
   async disconnect(): Promise<void> {
     logger.debug('[StreamableHttpPlugin] Disconnecting...');
-
     if (this.transport) {
       try {
         await this.transport.close();
@@ -79,25 +82,16 @@ export class StreamableHttpPlugin implements ITransportPlugin {
         logger.warn('[StreamableHttpPlugin] Error during transport cleanup:', error);
       }
     }
-
     this.transport = null;
-
     logger.debug('[StreamableHttpPlugin] Disconnected');
   }
 
   isConnected(): boolean {
-    // The plugin creates transports but doesn't manage connection state
-    // Connection state is managed by the main client
     return this.transport !== null;
   }
 
   isSupported(uri: string): boolean {
-    try {
-      const url = new URL(uri);
-      return url.protocol === 'http:' || url.protocol === 'https:';
-    } catch {
-      return false;
-    }
+    return isCanonicalCodeReviewGateway(uri, 'streamable-http');
   }
 
   getDefaultConfig(): PluginConfig {
@@ -111,13 +105,8 @@ export class StreamableHttpPlugin implements ITransportPlugin {
   }
 
   async isHealthy(): Promise<boolean> {
-    if (!this.isConnected() || !this.transport) {
-      return false;
-    }
-
+    if (!this.isConnected() || !this.transport) return false;
     try {
-      // For streamable HTTP, we assume healthy if transport exists
-      // The streamable HTTP transport handles its own health monitoring
       return true;
     } catch (error) {
       logger.warn('[StreamableHttpPlugin] Health check failed:', error);
@@ -126,12 +115,8 @@ export class StreamableHttpPlugin implements ITransportPlugin {
   }
 
   async callTool(client: Client, toolName: string, args: any): Promise<any> {
-    if (!this.isConnected()) {
-      throw new Error('StreamableHttpPlugin: Not connected');
-    }
-
+    if (!this.isConnected()) throw new Error('StreamableHttpPlugin: Not connected');
     logger.debug(`Calling tool: ${toolName}`);
-
     try {
       const result = await client.callTool({ name: toolName, arguments: args });
       logger.debug(`Tool call completed: ${toolName}`);
@@ -143,12 +128,8 @@ export class StreamableHttpPlugin implements ITransportPlugin {
   }
 
   async getPrimitives(client: Client): Promise<any[]> {
-    if (!this.isConnected()) {
-      throw new Error('StreamableHttpPlugin: Not connected');
-    }
-
+    if (!this.isConnected()) throw new Error('StreamableHttpPlugin: Not connected');
     logger.debug('[StreamableHttpPlugin] Getting primitives...');
-
     try {
       const capabilities = client.getServerCapabilities();
       const primitives: any[] = [];
@@ -156,31 +137,34 @@ export class StreamableHttpPlugin implements ITransportPlugin {
 
       if (capabilities?.resources) {
         promises.push(
-          client.listResources().then(({ resources }) => {
-            resources.forEach(item => primitives.push({ type: 'resource', value: item }));
-          }).catch(error => {
-            logger.warn('[StreamableHttpPlugin] Failed to list resources:', error);
-          }),
+          client
+            .listResources()
+            .then(({ resources }) => {
+              resources.forEach(item => primitives.push({ type: 'resource', value: item }));
+            })
+            .catch(error => logger.warn('[StreamableHttpPlugin] Failed to list resources:', error)),
         );
       }
 
       if (capabilities?.tools) {
         promises.push(
-          client.listTools().then(({ tools }) => {
-            tools.forEach(item => primitives.push({ type: 'tool', value: item }));
-          }).catch(error => {
-            logger.warn('[StreamableHttpPlugin] Failed to list tools:', error);
-          }),
+          client
+            .listTools()
+            .then(({ tools }) => {
+              tools.forEach(item => primitives.push({ type: 'tool', value: item }));
+            })
+            .catch(error => logger.warn('[StreamableHttpPlugin] Failed to list tools:', error)),
         );
       }
 
       if (capabilities?.prompts) {
         promises.push(
-          client.listPrompts().then(({ prompts }) => {
-            prompts.forEach(item => primitives.push({ type: 'prompt', value: item }));
-          }).catch(error => {
-            logger.warn('[StreamableHttpPlugin] Failed to list prompts:', error);
-          }),
+          client
+            .listPrompts()
+            .then(({ prompts }) => {
+              prompts.forEach(item => primitives.push({ type: 'prompt', value: item }));
+            })
+            .catch(error => logger.warn('[StreamableHttpPlugin] Failed to list prompts:', error)),
         );
       }
 

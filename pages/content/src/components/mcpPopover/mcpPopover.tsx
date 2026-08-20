@@ -6,6 +6,7 @@ import { instructionsState } from '../sidebar/Instructions/InstructionManager';
 import { HeadlessInstructionSync } from '../sidebar/Instructions/HeadlessInstructionSync';
 import { CodeReviewAccessFa } from '../CodeReviewAccessFa';
 import { SecurityCenterFa } from '../SecurityCenterFa';
+import { McpConnectionSettingsFa } from '../McpConnectionSettingsFa';
 import { AutomationService } from '../../services/automation.service';
 import { createLogger } from '@extension/shared/lib/logger';
 
@@ -551,6 +552,7 @@ export const MCPPopover: React.FC<MCPPopoverProps> = ({ toggleStateManager, adap
 
             <main style={{ padding: 16, overflowY: 'auto', minWidth: 0 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <McpConnectionSettingsFa />
                 <CodeReviewAccessFa />
                 <SecurityCenterFa />
 

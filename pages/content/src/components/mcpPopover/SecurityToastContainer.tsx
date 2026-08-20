@@ -6,6 +6,16 @@ interface ToastItem extends SecurityToastDetail {
   durationMs: number;
 }
 
+interface ReviewStatusResponse {
+  success?: boolean;
+  originSession?: {
+    id?: string;
+    owner?: string;
+    repo?: string;
+    durationMinutes?: number;
+  } | null;
+}
+
 const TOAST_OWNER_KEY = '__mcpSecurityToastOwner';
 
 function palette(variant: SecurityToastVariant | undefined) {
@@ -33,23 +43,69 @@ export function SecurityToastContainer() {
     (window as any)[TOAST_OWNER_KEY] = ownerId;
     setIsOwner(true);
 
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent<SecurityToastDetail>).detail;
+    const pushToast = (detail: SecurityToastDetail) => {
       if (!detail?.title) return;
 
       const id = detail.id || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const durationMs = Math.max(1500, detail.durationMs || 5000);
       const item: ToastItem = { ...detail, id, durationMs };
 
-      setItems(current => [...current.filter(entry => entry.id !== id).slice(-3), item]);
+      setItems(current => {
+        const semanticDuplicate = current.some(
+          entry => entry.title === item.title && entry.message === item.message && entry.variant === item.variant,
+        );
+        if (semanticDuplicate) return current;
+        return [...current.filter(entry => entry.id !== id).slice(-3), item];
+      });
 
       window.setTimeout(() => {
         setItems(current => current.filter(entry => entry.id !== id));
       }, durationMs);
     };
 
+    const handler = (event: Event) => {
+      pushToast((event as CustomEvent<SecurityToastDetail>).detail);
+    };
+
     window.addEventListener(SECURITY_TOAST_EVENT, handler);
+
+    let disposed = false;
+    const surfacedOriginSessions = new Set<string>();
+
+    const syncOriginSessionToast = async () => {
+      if (disposed || typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
+
+      try {
+        const response = (await chrome.runtime.sendMessage({
+          type: 'code-review:get-status',
+        })) as ReviewStatusResponse;
+        if (!response?.success || !response.originSession?.id) return;
+
+        const session = response.originSession;
+        const sessionId = session.id;
+        if (!sessionId || surfacedOriginSessions.has(sessionId)) return;
+        surfacedOriginSessions.add(sessionId);
+
+        const target = session.owner && session.repo ? `${session.owner}/${session.repo}` : 'مخزن GitHub';
+        const duration = Number(session.durationMinutes) || 0;
+        pushToast({
+          id: `origin-session-started:${sessionId}`,
+          title: 'دسترسی GitHub فعال شد',
+          message: `${target} در حالت فقط‌خواندنی${duration ? ` برای ${duration} دقیقه` : ''} فعال شد.`,
+          variant: 'success',
+          durationMs: 5500,
+        });
+      } catch {
+        // Status polling is best-effort; authoritative session state remains in the background Gate.
+      }
+    };
+
+    void syncOriginSessionToast();
+    const statusPoll = window.setInterval(() => void syncOriginSessionToast(), 500);
+
     return () => {
+      disposed = true;
+      window.clearInterval(statusPoll);
       window.removeEventListener(SECURITY_TOAST_EVENT, handler);
       if ((window as any)[TOAST_OWNER_KEY] === ownerId) {
         delete (window as any)[TOAST_OWNER_KEY];
